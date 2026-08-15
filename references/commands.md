@@ -4,6 +4,7 @@
 
 | Goal | Command |
 |---|---|
+| Pre-flight repo suitability | `graft-doctor.sh <repo>` (see below) |
 | Verify CLI/version | `graft --version` / `graft version` |
 | Orient in a repo | `graft map <repo> --json` |
 | Find relevant code | `graft ask "<question>" <repo> --source --json` |
@@ -12,7 +13,43 @@
 | Regex/literal search | `graft grep "<pattern>" <repo> [--fixed] --json` |
 | Check graph freshness | `graft check <repo> --json` |
 
-All query commands normally refresh the graph if it is stale. This is an implicit local write to `graft/`; use `--no-refresh` when the user requests strictly read-only behavior or has not approved graph refresh.
+All query commands normally refresh the graph if it is stale. This is an implicit local write to `graft/`; use `--no-refresh` when the user requests strictly read-only behavior or has not approved graph refresh. `map`, `ask`, `grep`, `callers`, and `skeleton` all accept `--no-refresh`.
+
+## Pre-flight doctor (`scripts/graft-doctor.sh`)
+
+Deterministic, dependency-free (POSIX sh + standard tools), read-only. It never writes to the target repo and never runs graft. Prints one JSON document on stdout:
+
+```
+usage: graft-doctor.sh <repo-path>
+```
+
+Exit codes map to states:
+
+| Exit | Status | Meaning | Guidance |
+|---|---|---|---|
+| 0 | `ready` | graph exists with nodes | queryable; orient with `graft map --json --no-refresh` |
+| 1 | `partial` | graph exists but empty/stale, or mixed source/orchestration repo | build only after user confirmation; often fallback (rg/limited reads) is better |
+| 2 | `unsupported` | no graft-supported code extensions | do **NOT** build; use rg/limited reads or index the real source dir |
+| 3 | `uninitialized` | no graph, but supported code exists | `graft init --dry-run --no-global` preview first; init/build only after confirmation |
+| 4 | `error` | path is not a directory, or bad usage | fix the path/arguments |
+
+Key JSON fields: `status`, `exit`, `signal`, `recommendation`, `graph.{exists,nodeCount,edgeCount,languages,empty}`, `files.{total,supported,supportedExtensions,topUnsupportedExtensions,mixed}`.
+
+### Doctor detection rules (deterministic)
+
+- **Empty graph**: `graft/` exists but `graft/.graph/wiring.json` has `nodeCount: 0`.
+- **No supported extensions**: zero files match the supported set below → `unsupported`.
+- **Mixed source/config**: supported files are a strict minority of total files → `mixed: true` (a signal, not a separate status).
+- **Missing directory**: target path does not exist or is not a directory → `error`.
+
+### Supported extensions (graft 0.10.1)
+
+```
+.ts .tsx .js .jsx .mjs .cjs .py .go .rs .java .kt .scala .rb .php
+.c .h .cpp .hpp .cc .cs .swift .sql .sh .proto
+```
+
+`--extensions` on `graft build`/`check` only **narrows** this walk set. It does **not** add support for OpenWrt `.config`, YAML/JSON data, `Makefile`, or any other language/file type. Do not present `--extensions` as a way to index unsupported content.
 
 ## Commands that require confirmation
 
@@ -39,3 +76,32 @@ graft init <repo> --agents agents --no-global
 ```
 
 Use `--no-build` only when the user explicitly wants wiring without an initial graph.
+
+## Fallback strategy: OpenWrt / build-orchestration repos
+
+These repos (e.g. an OpenWrt Builder) are dominated by files Graft does not index: OpenWrt `.config`, YAML CI workflows, `Makefile`, JSON/PKL metadata, init scripts. The doctor usually reports `unsupported` (no supported code files) or `partial` (graph empty / mixed).
+
+**Do not use `graft build` to work around missing language support.** Building only indexes the small supported subset (e.g. `.sh`, `.cjs` hooks); it will never make `.config`/YAML/`Makefile` queryable. The result is an empty or near-empty graph and wasted user-facing churn.
+
+Instead:
+
+1. **Use `rg` and limited reads**, scoped to the meaningful code/config directories:
+   - `config/` — the `.config` snippets (search by key, e.g. `CONFIG_PACKAGE_`)
+   - `sh/` and other `*.sh` — build/device scripts
+   - `Makefile` — package definitions (e.g. under `default-settings-*`)
+   - `default-settings-*` — default settings / init snippets
+   - `.github/` — CI workflow orchestration (YAML)
+2. **Index the real source directory instead.** If the actual OpenWrt source (e.g. `immortalwrt`, `openwrt`) lives in a separate directory, run the doctor against **that** directory and, after confirmation, build/query there. Do not build the Builder orchestration repo to answer questions about source code.
+
+Example read-only fallback commands:
+
+```sh
+# Search OpenWrt config keys across the Builder repo
+rg 'CONFIG_PACKAGE_' config/ -n
+
+# Inspect a device script
+rg -n 'mt5000|ipq' sh/ -i
+
+# Inspect CI workflow
+rg -n 'device|profile|target' .github/ -i
+```
