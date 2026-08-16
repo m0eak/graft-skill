@@ -9,15 +9,22 @@
 #
 # Statuses / exit codes
 #   0  ready          a graft/ graph exists and has nodes -> queryable
-#   1  partial        a graft/ graph exists but is empty/stale, or the repo is
-#                     a mixed source/orchestration repo -> build only after the
-#                     user confirms; often a fallback (rg/limited reads) is
-#                     more useful than build
+#   1  partial        fallback: a graft/ graph exists but is empty, OR the repo
+#                     is a mixed source/orchestration repo (supported files are
+#                     a minority) even when NO graft/ graph exists -> build only
+#                     after the user confirms; often a fallback (rg/limited
+#                     reads) is more useful than build
 #   2  unsupported    no graft-supported code extensions at all -> do NOT build;
 #                     use rg/limited reads or index the real source directory
-#   3  uninitialized  no graft/ graph, but supported code exists -> init/build
-#                     only after explicit user confirmation
+#   3  uninitialized  no graft/ graph, no mixed signal, but supported code
+#                     exists -> init/build only after explicit user confirmation
 #   4  error          bad usage, or the target path is not a directory
+#
+# Freshness
+#   This doctor does NOT judge whether a graph is fresh or stale; it only
+#   inspects graft/.graph/wiring.json on disk. Graph freshness must be
+#   confirmed separately with `graft check <repo> --json` (requires the graft
+#   CLI). The emitted top-level field is always "freshness":"not_checked".
 #
 # Read-only guarantee
 #   This script only reads the repository. It never creates, modifies, or
@@ -26,7 +33,9 @@
 #   exit.
 #
 # Supported extensions
-#   Mirror of graft 0.10.1 `CODE_EXTENSIONS` (from dist/context/build.js).
+#   Mirror of the graft 0.10.1 `CODE_EXTENSIONS` (from dist/context/build.js).
+#   The emitted `supportedSetVersion` reports the source version of this
+#   extension set, NOT a runtime Graft version detected by this doctor.
 #   `--extensions` on `graft build`/`graft check` only narrows this set; it does
 #   NOT add new language support, so a repo that is pure config/yml/Makefile
 #   cannot be made "supported" by passing flags.
@@ -70,7 +79,7 @@ json_escape() {
 # ---------------------------------------------------------------------------
 if [ ! -d "$repo" ]; then
   repo_esc=$(printf '%s' "$repo" | json_escape)
-  printf '{"schema":1,"doctor":"graft-doctor.sh","graftVersion":"0.10.1","repo":"%s","status":"error","exit":4,"signal":"path is not a directory","recommendation":"Pass a path to a directory that exists. Nothing was modified.","graph":{"exists":false,"dir":null,"wiringPresent":false,"nodeCount":0,"edgeCount":0,"languages":[],"empty":false},"files":{"total":0,"supported":0,"supportedExtensions":{},"topUnsupportedExtensions":[],"mixed":false},"notes":["Target path is not a directory; nothing to diagnose."]}\n' "$repo_esc"
+  printf '{"schema":1,"doctor":"graft-doctor.sh","supportedSetVersion":"0.10.1","freshness":"not_checked","repo":"%s","status":"error","exit":4,"signal":"path is not a directory","recommendation":"Pass a path to a directory that exists. Nothing was modified.","graph":{"exists":false,"dir":null,"wiringPresent":false,"nodeCount":0,"edgeCount":0,"languages":[],"empty":false},"files":{"total":0,"supported":0,"supportedExtensions":{},"topUnsupportedExtensions":[],"mixed":false},"notes":["Target path is not a directory; nothing to diagnose."]}\n' "$repo_esc"
   exit 4
 fi
 
@@ -210,19 +219,27 @@ fi
 
 # ---------------------------------------------------------------------------
 # Classification (precedence: error > ready > unsupported > partial > uninit)
+#   partial covers two fallback shapes:
+#     A) a graft/ graph exists but is empty (nodeCount == 0); or
+#     B) NO graft/ graph, but the repo is a mixed source/orchestration repo
+#        (supported files are a strict minority) -- building would only index
+#        the small supported subset, so init/build must not be proposed as a
+#        first step.
+#   uninitialized is only the clean case: no graph + supported code exists and
+#   no mixed signal.
 # ---------------------------------------------------------------------------
 status=uninitialized
 exit_code=3
-signal="no graft graph present"
+signal="no graft graph present; supported code exists and is not a minority"
 recommendation="Supported code exists but no graph yet. Initialize/build only after the user explicitly confirms; start with the non-mutating preview: graft init <repo> --dry-run --no-global."
-notes="[\"No graft/ graph present.\",\"Initialize only after explicit user confirmation.\",\"Run 'graft init <repo> --dry-run --no-global' for a preview first.\"]"
+notes="[\"No graft/ graph present.\",\"Repo is not flagged mixed; supported code is not a minority.\",\"Initialize only after explicit user confirmation.\",\"Run 'graft init <repo> --dry-run --no-global' for a preview first.\"]"
 
 if [ "$graph_exists" = true ] && [ "$node_count" -gt 0 ]; then
   status=ready
   exit_code=0
   signal="graft graph exists with $node_count nodes"
-  recommendation="Graph is ready. Orient with: graft map <repo> --json --no-refresh. Query with --no-refresh in strict read-only mode; without it, queries may refresh graft/ locally."
-  notes="[\"Graph is queryable.\",\"Strict read-only: append --no-refresh to ask/grep/callers/skeleton/map.\"]"
+  recommendation="Graph is ready. Orient with: graft map <repo> --json --no-refresh. Query with --no-refresh in strict read-only mode; without it, queries may refresh graft/ locally. The doctor does not judge freshness; confirm it with 'graft check <repo> --json' if needed."
+  notes="[\"Graph is queryable.\",\"Strict read-only: append --no-refresh to ask/grep/callers/skeleton/map.\",\"Doctor does not judge freshness; use 'graft check <repo> --json' for that.\"]"
 elif [ "$supported" -eq 0 ]; then
   status=unsupported
   exit_code=2
@@ -233,8 +250,14 @@ elif [ "$graph_exists" = true ]; then
   status=partial
   exit_code=1
   signal="graft graph exists but has 0 nodes"
-  recommendation="The graft/ graph exists but is empty (0 nodes). Rebuilding requires explicit user confirmation and only makes the few supported code files queryable. This repo looks like a mixed source/orchestration repo: prefer rg/limited reads scoped to code/config dirs (config/, sh/, Makefile, default-settings-*, .github/). If the real OpenWrt source lives in another directory, index that directory instead of the Builder orchestration repo."
-  notes="[\"graft/ exists but wiring.json has 0 nodes.\",\"Mixed source/orchestration repo: only $supported of $total files are graft-supported.\",\"Prefer rg/limited reads over build for config/yml/Makefile content.\",\"If real source is elsewhere, doctor+index that source directory.\"]"
+  recommendation="The graft/ graph exists but is empty (0 nodes). Rebuilding requires explicit user confirmation and only makes the few supported code files queryable. This repo looks like a mixed source/orchestration repo: prefer rg/limited reads scoped to code/config dirs (config/, sh/, Makefile, default-settings-*, .github/). If the real OpenWrt source lives in another directory, index that directory instead of the Builder orchestration repo. The doctor does not judge freshness; confirm it with 'graft check <repo> --json'."
+  notes="[\"graft/ exists but wiring.json has 0 nodes.\",\"Mixed source/orchestration repo: only $supported of $total files are graft-supported.\",\"Prefer rg/limited reads over build for config/yml/Makefile content.\",\"If real source is elsewhere, doctor+index that source directory.\",\"Doctor does not judge freshness; use 'graft check <repo> --json'.\"]"
+elif [ "$mixed" = true ]; then
+  status=partial
+  exit_code=1
+  signal="no graft graph; mixed source/orchestration repo"
+  recommendation="No graft/ graph yet, but this is a mixed source/orchestration repo: only $supported of $total files are graft-supported, so a build would produce a near-empty graph and needs explicit user confirmation. Prefer rg/limited reads scoped to code/config dirs; if the real source lives in another directory, doctor+index that directory instead. The doctor does not judge freshness; confirm it with 'graft check <repo> --json'."
+  notes="[\"No graft/ graph present.\",\"Repo flagged mixed: supported files ($supported) are a minority of $total total.\",\"Prefer rg/limited reads over build for config/yml/Makefile content.\",\"If real source is elsewhere, doctor+index that source directory.\",\"Init/build only after explicit user confirmation.\",\"Doctor does not judge freshness; use 'graft check <repo> --json'.\"]"
 fi
 
 # ---------------------------------------------------------------------------
@@ -244,7 +267,7 @@ repo_esc=$(printf '%s' "$repo" | json_escape)
 signal_esc=$(printf '%s' "$signal" | json_escape)
 rec_esc=$(printf '%s' "$recommendation" | json_escape)
 
-printf '{"schema":1,"doctor":"graft-doctor.sh","graftVersion":"0.10.1","repo":"%s","status":"%s","exit":%s,"signal":"%s","recommendation":"%s","graph":{"exists":%s,"dir":%s,"wiringPresent":%s,"nodeCount":%s,"edgeCount":%s,"languages":%s,"empty":%s},"files":{"total":%s,"supported":%s,"supportedExtensions":%s,"topUnsupportedExtensions":%s,"mixed":%s},"notes":%s}\n' \
+printf '{"schema":1,"doctor":"graft-doctor.sh","supportedSetVersion":"0.10.1","freshness":"not_checked","repo":"%s","status":"%s","exit":%s,"signal":"%s","recommendation":"%s","graph":{"exists":%s,"dir":%s,"wiringPresent":%s,"nodeCount":%s,"edgeCount":%s,"languages":%s,"empty":%s},"files":{"total":%s,"supported":%s,"supportedExtensions":%s,"topUnsupportedExtensions":%s,"mixed":%s},"notes":%s}\n' \
   "$repo_esc" "$status" "$exit_code" "$signal_esc" "$rec_esc" \
   "$graph_exists" "$graph_dir_json" "$wiring_present" "$node_count" "$edge_count" "$languages" "$graph_empty" \
   "$total" "$supported" "$sup_json" "$unsup_json" "$mixed" "$notes"

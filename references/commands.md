@@ -28,21 +28,27 @@ Exit codes map to states:
 | Exit | Status | Meaning | Guidance |
 |---|---|---|---|
 | 0 | `ready` | graph exists with nodes | queryable; orient with `graft map --json --no-refresh` |
-| 1 | `partial` | graph exists but empty/stale, or mixed source/orchestration repo | build only after user confirmation; often fallback (rg/limited reads) is better |
+| 1 | `partial` | fallback: graph exists but is empty, or the repo is a mixed source/orchestration repo (supported files a minority) even without a `graft/` graph | build only after user confirmation; often fallback (rg/limited reads) is better |
 | 2 | `unsupported` | no graft-supported code extensions | do **NOT** build; use rg/limited reads or index the real source dir |
-| 3 | `uninitialized` | no graph, but supported code exists | `graft init --dry-run --no-global` preview first; init/build only after confirmation |
+| 3 | `uninitialized` | no graph and no mixed signal, but supported code exists | `graft init --dry-run --no-global` preview first; init/build only after confirmation |
 | 4 | `error` | path is not a directory, or bad usage | fix the path/arguments |
 
-Key JSON fields: `status`, `exit`, `signal`, `recommendation`, `graph.{exists,nodeCount,edgeCount,languages,empty}`, `files.{total,supported,supportedExtensions,topUnsupportedExtensions,mixed}`.
+Key JSON fields: `supportedSetVersion`, `freshness` (always `"not_checked"`), `status`, `exit`, `signal`, `recommendation`, `graph.{exists,nodeCount,edgeCount,languages,empty}`, `files.{total,supported,supportedExtensions,topUnsupportedExtensions,mixed}`.
+
+**Freshness is not judged by the doctor.** It only inspects `graft/.graph/wiring.json` on disk; run `graft check <repo> --json` to confirm whether the graph is actually fresh.
 
 ### Doctor detection rules (deterministic)
 
-- **Empty graph**: `graft/` exists but `graft/.graph/wiring.json` has `nodeCount: 0`.
-- **No supported extensions**: zero files match the supported set below → `unsupported`.
-- **Mixed source/config**: supported files are a strict minority of total files → `mixed: true` (a signal, not a separate status).
+- **Empty graph**: `graft/` exists but `graft/.graph/wiring.json` has `nodeCount: 0` → `partial`.
+- **No supported extensions**: zero files match the supported set below → `unsupported` (takes precedence over partial/uninitialized).
+- **Mixed source/config**: supported files are a strict minority of total files → `mixed: true`.
+- **Mixed without a graph**: `mixed: true` and no `graft/` graph → `partial` (fallback; do not propose init/build as a first step).
+- **Uninitialized (clean)**: no `graft/` graph, `mixed: false`, and supported files exist → `uninitialized`.
 - **Missing directory**: target path does not exist or is not a directory → `error`.
 
-### Supported extensions (graft 0.10.1)
+### Supported extensions (supported-set source: graft 0.10.1)
+
+`supportedSetVersion` in the doctor output is the source version of this extension set (`"0.10.1"`), **not** a runtime Graft version detected by the doctor; use `graft --version` / `graft version` for the installed CLI.
 
 ```
 .ts .tsx .js .jsx .mjs .cjs .py .go .rs .java .kt .scala .rb .php
@@ -79,7 +85,7 @@ Use `--no-build` only when the user explicitly wants wiring without an initial g
 
 ## Fallback strategy: OpenWrt / build-orchestration repos
 
-These repos (e.g. an OpenWrt Builder) are dominated by files Graft does not index: OpenWrt `.config`, YAML CI workflows, `Makefile`, JSON/PKL metadata, init scripts. The doctor usually reports `unsupported` (no supported code files) or `partial` (graph empty / mixed).
+These repos (e.g. an OpenWrt Builder) are dominated by files Graft does not index: OpenWrt `.config`, YAML CI workflows, `Makefile`, JSON/PKL metadata, init scripts. The doctor usually reports `unsupported` (no supported code files) or `partial` — whether the graph is empty, or there is no graph at all but the repo is mixed (supported files a minority).
 
 **Do not use `graft build` to work around missing language support.** Building only indexes the small supported subset (e.g. `.sh`, `.cjs` hooks); it will never make `.config`/YAML/`Makefile` queryable. The result is an empty or near-empty graph and wasted user-facing churn.
 

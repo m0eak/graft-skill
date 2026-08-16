@@ -46,12 +46,14 @@ It prints one JSON document on stdout and exits with a code that maps to a state
 | Exit | Status | Meaning / next step |
 |---|---|---|
 | 0 | `ready` | Graph exists with nodes — orient with `graft map --json --no-refresh` |
-| 1 | `partial` | Graph exists but is empty/stale, or the repo is a mixed source/orchestration repo — build only after user confirmation; often a fallback (rg/limited reads) is more useful |
+| 1 | `partial` | Fallback: graph exists but is empty, or the repo is a mixed source/orchestration repo (supported files are a minority) even when no `graft/` graph exists — build only after user confirmation; often a fallback (rg/limited reads) is more useful |
 | 2 | `unsupported` | No graft-supported code extensions at all — do **NOT** build; use rg/limited reads, or index the real source directory |
-| 3 | `uninitialized` | No graph, but supported code exists — init/build only after explicit user confirmation (`graft init --dry-run --no-global` preview first) |
+| 3 | `uninitialized` | No graph and no mixed signal, but supported code exists — init/build only after explicit user confirmation (`graft init --dry-run --no-global` preview first) |
 | 4 | `error` | Target path is not a directory, or bad usage |
 
 The doctor reports graph node/edge counts, per-extension file stats, and a `mixed` flag when config/orchestration files dominate. Machine-parseable JSON makes it safe to gate automation on the result.
+
+**The doctor never judges graph freshness** — it only inspects `graft/.graph/wiring.json` on disk and always emits `"freshness":"not_checked"`. Confirm freshness separately with `graft check <repo> --json`. The `supportedSetVersion` field (`"0.10.1"`) is the source version of the supported-extension set, **not** a runtime Graft version detected by the doctor; use `graft --version` / `graft version` for the installed CLI version.
 
 Supported languages are the fixed set in the next section. **`--extensions` on `graft build`/`check` only narrows which of these files are walked; it does NOT add new language support.** A pure `.config`/YAML/`Makefile` orchestration repo cannot be made indexable by passing flags.
 
@@ -70,7 +72,9 @@ Supported languages are the fixed set in the next section. **`--extensions` on `
 
 Pass `--no-refresh` to query commands when strictly read-only behavior is required. Without it, Graft may structurally refresh stale files under `graft/` before answering.
 
-## Supported languages (graft 0.10.1)
+## Supported languages (supported-set source: graft 0.10.1)
+
+The doctor's `supportedSetVersion` (`"0.10.1"`) is the source version of this supported-extension set, **not** a runtime Graft version. Check the installed CLI with `graft --version` / `graft version`.
 
 The installed CLI indexes these code extensions by default (`CODE_EXTENSIONS` from the shipped package):
 
@@ -83,7 +87,7 @@ Anything else (OpenWrt `.config`, YAML/JSON data, `Makefile`, `.md`, `.pkl`, bin
 
 ## Fallback for unsupported / partial repos (OpenWrt builders etc.)
 
-When the doctor reports `unsupported` or `partial` for a repo dominated by build-orchestration files (OpenWrt `.config`, YAML workflows, `Makefile`, init scripts), do **not** use `graft build` to "solve" it — the resulting graph would be empty or near-empty:
+When the doctor reports `unsupported` or `partial` for a repo dominated by build-orchestration files (OpenWrt `.config`, YAML workflows, `Makefile`, init scripts), do **not** use `graft build` to "solve" it — the resulting graph would be empty or near-empty. A `partial` result is a fallback even when no `graft/` graph exists yet (mixed repo): do not propose `init`/`build` as a first step:
 
 - Prefer `rg` and limited reads, scoped to the meaningful code/config directories: `config/`, `sh/`, `Makefile`, `default-settings-*`, `.github/`.
 - If the real OpenWrt source code lives in a separate directory, run the doctor against and index **that** source directory, not the Builder orchestration repo.
@@ -124,7 +128,7 @@ Prefer native MCP registration (via reviewed `graft init`) over manually keeping
 
 ## Output discipline
 
-- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`), and whether the graph was fresh, stale, or absent.
+- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`), and whether the graph was fresh, stale, or absent. The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `graft check <repo> --json`.
 - Summarize query results with exact paths/symbols, not speculative conclusions.
 - If no graph exists, offer a preview and wait for approval before creating one.
 - Read [references/commands.md](references/commands.md) for the full command matrix, doctor exit codes, and the OpenWrt fallback strategy.
