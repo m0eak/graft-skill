@@ -4,14 +4,15 @@
 # Purpose
 #   Decide whether a repository is a good candidate for `graft build` and
 #   classify its current graph state, WITHOUT writing anything to the target
-#   repository and WITHOUT invoking the graft CLI. It is a pure filesystem
-#   analysis: deterministic, dependency-free (POSIX sh + standard tools).
+#   repository. It is a pure filesystem analysis (POSIX sh + standard tools)
+#   plus a read-only `graft --version` probe for runtime discovery.
 #
 # Statuses / exit codes
 #   0  ready          a graft/ graph exists and has nodes -> queryable
-#   1  partial        fallback: a graft/ graph exists but is empty, OR the repo
-#                     is a mixed source/orchestration repo (supported files are
-#                     a minority) even when NO graft/ graph exists -> build only
+#   1  partial        fallback: a graft/ graph exists but is empty (empty graph,
+#                     possibly never built or the build failed), OR the repo is
+#                     a mixed source/orchestration repo (supported files are a
+#                     minority) even when NO graft/ graph exists -> build only
 #                     after the user confirms; often a fallback (rg/limited
 #                     reads) is more useful than build
 #   2  unsupported    no graft-supported code extensions at all -> do NOT build;
@@ -19,26 +20,32 @@
 #   3  uninitialized  no graft/ graph, no mixed signal, but supported code
 #                     exists -> init/build only after explicit user confirmation
 #   4  error          bad usage, or the target path is not a directory
+#   5  unavailable    the supported-extension set cannot be determined (graft
+#                     and/or the @nanonets/graft npm package missing, or
+#                     CODE_EXTENSIONS could not be extracted). The doctor does
+#                     NOT silently fall back to a stale hard-coded list; it
+#                     reports this state with install / manual-check guidance.
 #
 # Freshness
 #   This doctor does NOT judge whether a graph is fresh or stale; it only
 #   inspects graft/.graph/wiring.json on disk. Graph freshness must be
-#   confirmed separately with `graft check <repo> --json` (requires the graft
-#   CLI). The emitted top-level field is always "freshness":"not_checked".
+#   confirmed separately with `graft check <repo> --json` (via
+#   scripts/graft-check.sh). The emitted top-level field is always
+#   "freshness":"not_checked".
 #
 # Read-only guarantee
-#   This script only reads the repository. It never creates, modifies, or
-#   deletes anything under the target path, and it never runs graft. It does
-#   create a temporary scratch dir under ${TMPDIR:-/tmp} which is removed on
-#   exit.
+#   This script only reads the repository and the installed graft package. It
+#   never creates, modifies, or deletes anything under the target path. It runs
+#   `graft --version` (read-only) for runtime discovery when graft is
+#   available. It does create a temporary scratch dir under ${TMPDIR:-/tmp}
+#   which is removed on exit.
 #
-# Supported extensions
-#   Mirror of the graft 0.10.1 `CODE_EXTENSIONS` (from dist/context/build.js).
-#   The emitted `supportedSetVersion` reports the source version of this
-#   extension set, NOT a runtime Graft version detected by this doctor.
-#   `--extensions` on `graft build`/`graft check` only narrows this set; it does
-#   NOT add new language support, so a repo that is pure config/yml/Makefile
-#   cannot be made "supported" by passing flags.
+# Runtime / supported-set discovery
+#   Delegates to scripts/graft-runtime.sh: resolves the graft binary, the CLI
+#   version, the @nanonets/graft package dir, package.json version, and the
+#   real CODE_EXTENSIONS list from dist/context/build.js. Nothing is
+#   hard-coded. If discovery cannot produce a supported-extension set, the
+#   doctor reports status "unavailable" (exit 5) instead of guessing.
 #
 # Usage
 #   graft-doctor.sh <repo-path>
@@ -49,15 +56,14 @@
 
 set -eu
 
-CODE_EXTENSIONS=".ts .tsx .js .jsx .mjs .cjs .py .go .rs .java .kt .scala .rb .php .c .h .cpp .hpp .cc .cs .swift .sql .sh .proto"
-
 usage() {
   cat >&2 <<'EOF'
 usage: graft-doctor.sh <repo-path>
 
 Deterministic read-only pre-flight for Graft. Prints one JSON document to
-stdout. Exit codes: 0=ready 1=partial 2=unsupported 3=uninitialized 4=error.
-Never writes to <repo-path>; never runs the graft CLI.
+stdout. Exit codes: 0=ready 1=partial 2=unsupported 3=uninitialized 4=error
+5=unavailable (supported-set discovery failed). Never writes to <repo-path>;
+only runs `graft --version` (read-only) for runtime discovery.
 EOF
 }
 
@@ -65,7 +71,6 @@ case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   '') usage; exit 4 ;;
 esac
-
 repo="$1"
 
 # JSON string body escaping: backslash and double quote, then collapse
@@ -75,13 +80,121 @@ json_escape() {
 }
 
 # ---------------------------------------------------------------------------
+# Runtime / supported-set discovery (dynamic; never hard-coded)
+# ---------------------------------------------------------------------------
+SCRIPTS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+GRAFT_BIN=""
+GRAFT_RUNTIME_VERSION=""
+GRAFT_PKG_DIR=""
+GRAFT_SUPPORTED_SET_VERSION=""
+GRAFT_CODE_EXTENSIONS=""
+GRAFT_SUPPORT_DISCOVERY=""
+_runtime_out=$(sh "$SCRIPTS_DIR/graft-runtime.sh" --shell 2>/dev/null || true)
+eval "$_runtime_out"
+
+# supportedExtensions array (or null)
+sup_set_json="null"
+if [ -n "$GRAFT_CODE_EXTENSIONS" ]; then
+  sup_set_json="["
+  _sep=""
+  for _e in $GRAFT_CODE_EXTENSIONS; do
+    _ee=$(printf '%s' "$_e" | json_escape)
+    sup_set_json="$sup_set_json$_sep\"$_ee\""
+    _sep=","
+  done
+  sup_set_json="$sup_set_json]"
+fi
+
+# discoveryNotes array
+discovery_notes=""
+add_note() {
+  _nn=$(printf '%s' "$1" | json_escape)
+  [ "$discovery_notes" != "" ] && discovery_notes="$discovery_notes,"
+  discovery_notes="$discovery_notes\"$_nn\""
+}
+case "$GRAFT_SUPPORT_DISCOVERY" in
+  ok)
+    add_note "Resolved runtime discovery from $GRAFT_PKG_DIR."
+    if [ -n "$GRAFT_RUNTIME_VERSION" ]; then
+      add_note "Installed CLI version: $GRAFT_RUNTIME_VERSION (graft --version)."
+    else
+      add_note "graft binary present but its version could not be read."
+    fi
+    add_note "Supported-set version read from package.json: $GRAFT_SUPPORTED_SET_VERSION."
+    ;;
+  not_installed)
+    add_note "No graft binary on PATH and no @nanonets/graft package found via npm root -g / npm prefix -g."
+    add_note "Install with 'npm install -g @nanonets/graft' (Node.js >=20) only after the user confirms, then re-run the doctor."
+    ;;
+  package_not_found)
+    add_note "graft binary found at ${GRAFT_BIN:-?} but the @nanonets/graft package directory could not be located."
+    add_note "Run 'npm root -g' and check for @nanonets/graft, or resolve the graft bin symlink to find dist/cli.js, then re-run."
+    ;;
+  extract_failed)
+    add_note "Package found at ${GRAFT_PKG_DIR:-?} but CODE_EXTENSIONS could not be extracted from dist/context/build.js."
+    add_note "Inspect that file manually for the CODE_EXTENSIONS array; do not rely on a stale hard-coded list."
+    ;;
+  *)
+    add_note "Unrecognized supportDiscovery state: $GRAFT_SUPPORT_DISCOVERY."
+    ;;
+esac
+[ "$discovery_notes" != "" ] && discovery_notes="[$discovery_notes]" || discovery_notes="[]"
+
+# Runtime fields used by error / unavailable / normal output
+_rt_ver=$(printf '%s' "$GRAFT_RUNTIME_VERSION" | json_escape)
+_set_ver=$(printf '%s' "$GRAFT_SUPPORTED_SET_VERSION" | json_escape)
+if [ -n "$GRAFT_RUNTIME_VERSION" ]; then
+  _rt_ver_json="\"$_rt_ver\""
+else
+  _rt_ver_json="null"
+fi
+if [ -n "$GRAFT_SUPPORTED_SET_VERSION" ]; then
+  _set_ver_json="\"$_set_ver\""
+else
+  _set_ver_json="null"
+fi
+
+# ---------------------------------------------------------------------------
 # Error: not a directory
 # ---------------------------------------------------------------------------
 if [ ! -d "$repo" ]; then
   repo_esc=$(printf '%s' "$repo" | json_escape)
-  printf '{"schema":1,"doctor":"graft-doctor.sh","supportedSetVersion":"0.10.1","freshness":"not_checked","repo":"%s","status":"error","exit":4,"signal":"path is not a directory","recommendation":"Pass a path to a directory that exists. Nothing was modified.","graph":{"exists":false,"dir":null,"wiringPresent":false,"nodeCount":0,"edgeCount":0,"languages":[],"empty":false},"files":{"total":0,"supported":0,"supportedExtensions":{},"topUnsupportedExtensions":[],"mixed":false},"notes":["Target path is not a directory; nothing to diagnose."]}\n' "$repo_esc"
+  printf '{"schema":1,"doctor":"graft-doctor.sh","runtimeVersion":%s,"supportedSetVersion":%s,"supportedExtensions":%s,"supportDiscovery":"%s","discoveryNotes":%s,"freshness":"not_checked","repo":"%s","status":"error","exit":4,"signal":"path is not a directory","recommendation":"Pass a path to a directory that exists. Nothing was modified.","graph":{"exists":false,"dir":null,"wiringPresent":false,"nodeCount":0,"edgeCount":0,"languages":[],"empty":false},"files":{"total":0,"supported":0,"supportedExtensions":{},"topUnsupportedExtensions":[],"mixed":false},"notes":["Target path is not a directory; nothing to diagnose."]}\n' \
+    "$_rt_ver_json" "$_set_ver_json" "$sup_set_json" "$GRAFT_SUPPORT_DISCOVERY" "$discovery_notes" "$repo_esc"
   exit 4
 fi
+
+# ---------------------------------------------------------------------------
+# Error: supported-set discovery failed -> report, do NOT guess
+# ---------------------------------------------------------------------------
+if [ "$GRAFT_SUPPORT_DISCOVERY" != "ok" ]; then
+  repo_esc=$(printf '%s' "$repo" | json_escape)
+  case "$GRAFT_SUPPORT_DISCOVERY" in
+    not_installed)
+      _sig="cannot determine supported extensions: graft CLI and @nanonets/graft package are not installed"
+      _rec="Install graft only after the user confirms (npm install -g @nanonets/graft, Node.js >=20), then re-run the doctor. Nothing was modified."
+      ;;
+    package_not_found)
+      _sig="cannot determine supported extensions: @nanonets/graft package could not be located"
+      _rec="Locate the @nanonets/graft package (npm root -g, or the graft bin symlink target) and re-run the doctor, or verify the supported set manually against dist/context/build.js. Nothing was modified."
+      ;;
+    extract_failed)
+      _sig="cannot determine supported extensions: CODE_EXTENSIONS extraction failed"
+      _rec="Inspect ${GRAFT_PKG_DIR:-the package}/dist/context/build.js manually for the CODE_EXTENSIONS array; do not rely on a stale hard-coded list. Nothing was modified."
+      ;;
+    *)
+      _sig="cannot determine supported extensions (discovery state: $GRAFT_SUPPORT_DISCOVERY)"
+      _rec="Resolve runtime discovery and re-run the doctor. Nothing was modified."
+      ;;
+  esac
+  _sig_esc=$(printf '%s' "$_sig" | json_escape)
+  _rec_esc=$(printf '%s' "$_rec" | json_escape)
+  printf '{"schema":1,"doctor":"graft-doctor.sh","runtimeVersion":%s,"supportedSetVersion":%s,"supportedExtensions":%s,"supportDiscovery":"%s","discoveryNotes":%s,"freshness":"not_checked","repo":"%s","status":"unavailable","exit":5,"signal":"%s","recommendation":"%s","graph":{"exists":false,"dir":null,"wiringPresent":false,"nodeCount":0,"edgeCount":0,"languages":[],"empty":false},"files":{"total":0,"supported":0,"supportedExtensions":{},"topUnsupportedExtensions":[],"mixed":false},"notes":["Supported-extension set could not be determined; classification skipped."]}\n' \
+    "$_rt_ver_json" "$_set_ver_json" "$sup_set_json" "$GRAFT_SUPPORT_DISCOVERY" "$discovery_notes" "$repo_esc" "$_sig_esc" "$_rec_esc"
+  exit 5
+fi
+
+CODE_EXTENSIONS="$GRAFT_CODE_EXTENSIONS"
 
 # ---------------------------------------------------------------------------
 # Read-only walk: aggregate file metrics with a single awk pass.
@@ -220,9 +333,13 @@ fi
 # ---------------------------------------------------------------------------
 # Classification (precedence: error > ready > unsupported > partial > uninit)
 #   partial covers two fallback shapes:
-#     A) a graft/ graph exists but is empty (nodeCount == 0); or
+#     A) a graft/ graph exists but is empty (nodeCount == 0):
+#        - if the repo is ALSO mixed (supported files a strict minority)
+#          -> mixed fallback wording
+#        - otherwise -> EMPTY GRAPH wording (possibly never built, or the build
+#          failed); this is NOT a mixed repo and must not be called one
 #     B) NO graft/ graph, but the repo is a mixed source/orchestration repo
-#        (supported files are a strict minority) -- building would only index
+#        (supported files are a strict minority) -> building would only index
 #        the small supported subset, so init/build must not be proposed as a
 #        first step.
 #   uninitialized is only the clean case: no graph + supported code exists and
@@ -244,14 +361,20 @@ elif [ "$supported" -eq 0 ]; then
   status=unsupported
   exit_code=2
   signal="no graft-supported code extensions found"
-  recommendation="Graft 0.10.1 indexes only the code extensions baked into CODE_EXTENSIONS; a config/orchestration-only repo cannot be made supported with --extensions. Do NOT use 'graft build' here -- it would produce an empty graph. Use rg/limited reads instead, and if the real source code lives in another directory, run the doctor against that directory and index it."
-  notes="[\"No supported code files (of $total total).\",\"graft 0.10.1 CODE_EXTENSIONS: $CODE_EXTENSIONS\",\"--extensions only narrows the walk; it does not add config/yml/Makefile support.\",\"Do NOT build as a workaround.\"]"
+  recommendation="Graft indexes only the code extensions in CODE_EXTENSIONS (supported-set version: $GRAFT_SUPPORTED_SET_VERSION); a config/orchestration-only repo cannot be made supported with --extensions. Do NOT use 'graft build' here -- it would produce an empty graph. Use rg/limited reads instead, and if the real source code lives in another directory, run the doctor against that directory and index it."
+  notes="[\"No supported code files (of $total total).\",\"CODE_EXTENSIONS: $CODE_EXTENSIONS\",\"--extensions only narrows the walk; it does not add config/yml/Makefile support.\",\"Do NOT build as a workaround.\"]"
 elif [ "$graph_exists" = true ]; then
   status=partial
   exit_code=1
-  signal="graft graph exists but has 0 nodes"
-  recommendation="The graft/ graph exists but is empty (0 nodes). Rebuilding requires explicit user confirmation and only makes the few supported code files queryable. This repo looks like a mixed source/orchestration repo: prefer rg/limited reads scoped to code/config dirs (config/, sh/, Makefile, default-settings-*, .github/). If the real OpenWrt source lives in another directory, index that directory instead of the Builder orchestration repo. The doctor does not judge freshness; confirm it with 'graft check <repo> --json'."
-  notes="[\"graft/ exists but wiring.json has 0 nodes.\",\"Mixed source/orchestration repo: only $supported of $total files are graft-supported.\",\"Prefer rg/limited reads over build for config/yml/Makefile content.\",\"If real source is elsewhere, doctor+index that source directory.\",\"Doctor does not judge freshness; use 'graft check <repo> --json'.\"]"
+  if [ "$mixed" = true ]; then
+    signal="graft graph exists but has 0 nodes (empty graph) in a mixed source/orchestration repo"
+    recommendation="The graft/ graph exists but is empty (0 nodes) and the repo is mixed: only $supported of $total files are graft-supported, so a rebuild only makes that small subset queryable and needs explicit user confirmation. Prefer rg/limited reads scoped to code/config dirs (config/, sh/, Makefile, default-settings-*, .github/). If the real OpenWrt source lives in another directory, index that directory instead of the Builder orchestration repo. The doctor does not judge freshness; confirm it with 'graft check <repo> --json'."
+    notes="[\"graft/ exists but wiring.json has 0 nodes.\",\"Mixed source/orchestration repo: only $supported of $total files are graft-supported.\",\"Prefer rg/limited reads over build for config/yml/Makefile content.\",\"If real source is elsewhere, doctor+index that source directory.\",\"Doctor does not judge freshness; use 'graft check <repo> --json'.\"]"
+  else
+    signal="graft graph exists but has 0 nodes (empty graph; possibly never built or the build failed)"
+    recommendation="The graft/ graph exists but is empty (0 nodes). This is likely an empty graph that was never built or whose build failed -- NOT a mixed repo (supported code files are not a minority: $supported of $total files). Rebuilding after explicit user confirmation may produce a useful graph; run 'graft init <repo> --dry-run --no-global' for a preview first, then confirm before building. The doctor does not judge freshness; confirm it with 'graft check <repo> --json'."
+    notes="[\"graft/ exists but wiring.json has 0 nodes.\",\"Repo is not flagged mixed; supported code files are not a minority.\",\"Empty graph: possibly never built or the build failed.\",\"Rebuild only after explicit user confirmation (preview with graft init --dry-run --no-global first).\",\"Doctor does not judge freshness; use 'graft check <repo> --json'.\"]"
+  fi
 elif [ "$mixed" = true ]; then
   status=partial
   exit_code=1
@@ -267,7 +390,8 @@ repo_esc=$(printf '%s' "$repo" | json_escape)
 signal_esc=$(printf '%s' "$signal" | json_escape)
 rec_esc=$(printf '%s' "$recommendation" | json_escape)
 
-printf '{"schema":1,"doctor":"graft-doctor.sh","supportedSetVersion":"0.10.1","freshness":"not_checked","repo":"%s","status":"%s","exit":%s,"signal":"%s","recommendation":"%s","graph":{"exists":%s,"dir":%s,"wiringPresent":%s,"nodeCount":%s,"edgeCount":%s,"languages":%s,"empty":%s},"files":{"total":%s,"supported":%s,"supportedExtensions":%s,"topUnsupportedExtensions":%s,"mixed":%s},"notes":%s}\n' \
+printf '{"schema":1,"doctor":"graft-doctor.sh","runtimeVersion":%s,"supportedSetVersion":%s,"supportedExtensions":%s,"supportDiscovery":"%s","discoveryNotes":%s,"freshness":"not_checked","repo":"%s","status":"%s","exit":%s,"signal":"%s","recommendation":"%s","graph":{"exists":%s,"dir":%s,"wiringPresent":%s,"nodeCount":%s,"edgeCount":%s,"languages":%s,"empty":%s},"files":{"total":%s,"supported":%s,"supportedExtensions":%s,"topUnsupportedExtensions":%s,"mixed":%s},"notes":%s}\n' \
+  "$_rt_ver_json" "$_set_ver_json" "$sup_set_json" "$GRAFT_SUPPORT_DISCOVERY" "$discovery_notes" \
   "$repo_esc" "$status" "$exit_code" "$signal_esc" "$rec_esc" \
   "$graph_exists" "$graph_dir_json" "$wiring_present" "$node_count" "$edge_count" "$languages" "$graph_empty" \
   "$total" "$supported" "$sup_json" "$unsup_json" "$mixed" "$notes"
