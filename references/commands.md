@@ -138,6 +138,17 @@ Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`/`u
 
 The wrapper runs `graft check` (pure I/O + hashing in the installed CLI, no writes) and `graft --version`; it never calls init/build/install/upgrade and never writes to the target repository.
 
+### Regressions
+
+`scripts/test-check.sh` is the suite for this state machine — 18 synthetic cases over a fake `graft` (no real CLI, no network, no repo writes) plus 2 integration cases against the installed CLI in a throwaway repo. Run it after any change to `graft-check.sh`:
+
+```sh
+./scripts/test-check.sh            # all cases
+GRAFT_TEST_NO_CLI=1 ./scripts/test-check.sh   # synthetic only
+```
+
+Exit 0 means every case passed; any mismatch prints `FAIL <case>` and exits 1. When changing a classification rule, change the suite in the same commit.
+
 ## Safer mutation preflight
 
 Before `init`, run:
