@@ -8,21 +8,27 @@
 #   which must be judged "needs_initialization", not "usable".
 #
 # Semantics (derived from parsed JSON only)
-#   status              fresh | stale | needs_initialization | error
-#   usable              true only when context.ok && graph.ok (fresh)
-#   freshness           fresh | stale | not_built (when no context graph)
+#   status              fresh | structural_only | stale | needs_initialization | indeterminate | error
+#   usable              true when the structural graph is current and holds nodes
+#                       (fresh, or structural_only when the --deep concept layer
+#                       is absent — the normal result of a plain `graft build`)
+#   freshness           fresh | stale | not_built | unknown
 #   context             { ok, missing, drifted, contentDrift, removed, coverage, indexDrift }
-#   graph               { ok, missing, drifted, added, removed, changed, stale, pending }
+#   graph               { ok, missing, drifted, nodes, added, removed, changed, stale, pending }
+#   nodesSource         cli | wiring.json | unknown — where the node count came from
 #
 # Classification
-#   context.missing=true           -> needs_initialization (even if CLI exit 0)
-#   context.ok && graph.ok         -> fresh / usable
-#   otherwise (drift)              -> stale
+#   context.ok && graph.ok                -> fresh / usable
+#   graph.ok && nodes>0 && context.missing -> structural_only / usable
+#   graph.missing, or nodes==0            -> needs_initialization
+#   node count unknowable                  -> indeterminate (do not guess)
+#   graph exists but drifted              -> stale
 #
 # Exit codes
-#   0  fresh
+#   0  fresh or structural_only
 #   1  stale
 #   2  needs_initialization
+#   3  indeterminate (no node count available to distinguish empty from populated)
 #   10 graft CLI not found
 #   11 graft check output could not be parsed
 #   12 target path is not a directory, or bad usage
@@ -44,9 +50,9 @@ usage() {
 usage: graft-check.sh <repo-path>
 
 Safe JSON wrapper around `graft check <repo> --json`. Prints one JSON document
-to stdout. Exit codes: 0=fresh 1=stale 2=needs_initialization 10=graft not
-found 11=unparseable output 12=bad path. Never writes to the repo and never
-calls init/build/install/upgrade.
+to stdout. Exit codes: 0=fresh/structural_only 1=stale 2=needs_initialization
+3=indeterminate 10=graft not found 11=unparseable output 12=bad path. Never
+writes to the repo and never calls init/build/install/upgrade.
 EOF
 }
 
@@ -275,6 +281,25 @@ if [ "$graph_added" -gt 0 ] || [ "$graph_removed" -gt 0 ] \
    || [ "$graph_changed" -gt 0 ] || [ "$graph_stale" -gt 0 ]; then
   graph_drifted="true"
 fi
+
+# ---------------------------------------------------------------------------
+# Node-count fallback for CLIs that do not report graph.nodes (pre-0.28).
+# The wiring file is read directly instead of guessing: without a count the
+# wrapper could not tell an empty graph from a populated one, and reporting
+# "uninitialized" on that uncertainty would send the user to rebuild a graph
+# that already works.
+# ---------------------------------------------------------------------------
+nodes_source="cli"
+if [ -z "$graph_nodes" ]; then
+  nodes_source="unknown"
+  if [ -f "$repo/graft/.graph/wiring.json" ]; then
+    _wn=$(sed -n 's/.*"nodeCount"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$repo/graft/.graph/wiring.json" | head -n 1)
+    case "$_wn" in
+      ''|*[!0-9]*) : ;;
+      *) graph_nodes="$_wn"; nodes_source="wiring.json" ;;
+    esac
+  fi
+fi
 # ---------------------------------------------------------------------------
 # Classification from parsed fields only (never the bare CLI exit code)
 #
@@ -331,13 +356,13 @@ elif [ -n "$graph_nodes" ] && [ "$graph_nodes" = "0" ]; then
   recommendation="The graph is present but empty, so there is nothing to query. Check that the repo contains files in a supported language (run graft-doctor.sh); if it does, rebuild only after explicit user confirmation. Do not treat an empty graph as usable."
   notes="[\"graph.nodes=0: the graph holds no symbols.\",\"Run graft-doctor.sh to confirm the repo has supported source files.\",\"Rebuild only after explicit user confirmation.\"]"
 elif [ -z "$graph_nodes" ] && [ "$context_missing" = true ]; then
-  status="needs_initialization"
-  exit_code=2
+  status="indeterminate"
+  exit_code=3
   usable=false
-  freshness="not_built"
-  signal="context.missing=true and no graph node count reported by this CLI version"
-  recommendation="This CLI version does not report graph.nodes, so the wrapper cannot tell an empty graph from a populated one. Run the doctor, then init/build only after explicit user confirmation. Nothing was modified."
-  notes="[\"graph.nodes is absent from this CLI's check output (pre-0.28 format).\",\"Falling back to the conservative verdict: not usable.\",\"Run graft-doctor.sh before proposing a build.\"]"
+  freshness="unknown"
+  signal="this CLI reports neither graph.nodes nor a readable graft/.graph/wiring.json nodeCount, so an empty graph cannot be distinguished from a populated one"
+  recommendation="Do not report this repo as needing initialization on this evidence alone. Inspect graft/.graph/wiring.json (or the graft/ tree) directly, or confirm with the doctor, before proposing any build. Nothing was modified."
+  notes="[\"graph.nodes is absent from this CLI's check output (pre-0.28 format).\",\"No node count could be read from graft/.graph/wiring.json either.\",\"Verdict is genuinely unknown; do not assert 'not initialized' and do not infer 'usable'.\",\"Inspect the graft/ tree directly before proposing a rebuild.\"]"
 else
   status="stale"
   exit_code=1
@@ -365,8 +390,8 @@ if [ -n "$CLI_VERSION" ]; then
   cli_ver_json=$(printf '"%s"' "$(printf '%s' "$CLI_VERSION" | sed 's/\\/\\\\/g; s/"/\\"/g')")
 fi
 
-printf '{"schema":1,"wrapper":"graft-check.sh","repo":"%s","status":"%s","usable":%s,"freshness":"%s","deepLayer":"%s","context":{"ok":%s,"missing":%s,"drifted":%s,"contentDrift":%s,"removed":%s,"coverage":%s,"indexDrift":%s},"graph":{"ok":%s,"missing":%s,"drifted":%s,"nodes":%s,"added":%s,"removed":%s,"changed":%s,"stale":%s,"pending":%s},"cli":{"found":true,"version":%s,"exitCode":%s},"signal":"%s","recommendation":"%s","notes":%s}\n' \
-  "$repo_esc" "$status" "$usable" "$freshness" "$deep_layer" \
+printf '{"schema":1,"wrapper":"graft-check.sh","repo":"%s","status":"%s","usable":%s,"freshness":"%s","deepLayer":"%s","nodesSource":"%s","context":{"ok":%s,"missing":%s,"drifted":%s,"contentDrift":%s,"removed":%s,"coverage":%s,"indexDrift":%s},"graph":{"ok":%s,"missing":%s,"drifted":%s,"nodes":%s,"added":%s,"removed":%s,"changed":%s,"stale":%s,"pending":%s},"cli":{"found":true,"version":%s,"exitCode":%s},"signal":"%s","recommendation":"%s","notes":%s}\n' \
+  "$repo_esc" "$status" "$usable" "$freshness" "$deep_layer" "$nodes_source" \
   "$context_ok" "$context_missing" "$context_drifted" \
   "$context_contentDrift" "$context_removed" "$context_coverage" "$context_indexDrift" \
   "$graph_ok" "$graph_missing" "$graph_drifted" "$graph_nodes_json" \

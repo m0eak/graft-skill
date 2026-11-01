@@ -44,7 +44,15 @@ graft telemetry          # status, endpoint, queued count
 graft telemetry debug    # prints the exact batch a flush would POST, sends nothing
 ```
 
-`debug` is an inspection command only — it does not send, and it does not stop the scheduled daily flush either. If the user wants no outbound telemetry, the lever is `graft telemetry disable` (or `DO_NOT_TRACK=1`), not `debug`.
+`debug` prints the batch and sends nothing **itself**, but that is not the whole story. The CLI runs a startup hook (`preAction`) for every subcommand except `version`, `upgrade`, `_update-check` and `mcp` — `telemetry` is not exempt. So a `graft telemetry debug` invocation still evaluates the background update check and the flush gate (24h since the last `flushedAt`), and if that gate is open the invocation can trigger a detached send.
+
+If the point of the command is "show me this without anything leaving the machine", run it as:
+
+```sh
+DO_NOT_TRACK=1 graft telemetry debug
+```
+
+`DO_NOT_TRACK` (or `graft telemetry disable`) is the actual off switch; `debug` alone is not.
 
 What the payload actually contains (verified on the wire body, not the docs): `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (an opaque random UUID), `distinct_id` (per-install id), `timestamp`. It does **not** contain source code, file paths, file names, or repository names.
 
@@ -203,7 +211,8 @@ Prefer native MCP registration (via reviewed `graft init`) over manually keeping
 
 ## Output discipline
 
-- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`structural_only`/`stale`/`needs_initialization`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`deepLayer` from the parsed `graft check --json` output). Report `deepLayer: missing` as "structural graph only", never as "not initialized".
+- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`structural_only`/`stale`/`needs_initialization`/`indeterminate`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`deepLayer`/`nodesSource` from the parsed `graft check --json` output).
+- `deepLayer: missing` means "no `--deep` concept layer", which is only reassuring when `status` is `structural_only`. If `status` is `needs_initialization` or `indeterminate`, the structural graph itself is absent, empty, or unknown — never describe those as "structural graph only".
 - Summarize query results with exact paths/symbols, not speculative conclusions.
 - If no graph exists, offer a preview and wait for approval before creating one.
 - Read [references/commands.md](references/commands.md) for the full command matrix, doctor exit codes, the check-wrapper semantics, and the OpenWrt fallback strategy.

@@ -35,7 +35,7 @@ Newer releases (anything past 0.10.1) have anonymous telemetry **on by default**
 | Command | Effect |
 |---|---|
 | `graft telemetry` | Status: state, endpoint, queued count |
-| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing, but does not stop the scheduled flush either |
+| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing itself, but the invocation still runs the startup hook (update check + 24h flush gate), so it can trigger a detached flush. Use `DO_NOT_TRACK=1 graft telemetry debug` to be sure |
 | `graft telemetry disable` | Turns it off (equivalent to `DO_NOT_TRACK=1`) |
 
 Verified payload fields: `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (opaque UUID), `distinct_id` (per-install id), `timestamp`. No source code, paths, or repository names.
@@ -111,7 +111,7 @@ The supported-extension set is discovered by `scripts/graft-runtime.sh` from the
 
 ## Check wrapper (`scripts/graft-check.sh`)
 
-Safe JSON wrapper around `graft check <repo> --json`. It reports the real CLI exit code but **never classifies from it alone**: the CLI can exit 0 while `context.missing=true`, which must be judged `needs_initialization`, not usable. It parses `context.ok`, `context.missing`, `graph.ok` and the drift arrays.
+Safe JSON wrapper around `graft check <repo> --json`. It reports the real CLI exit code but **never classifies from it alone**: the CLI exits 0 for an empty graph, for a healthy structural-only graph, and even when no graph exists. It parses `context.ok`, `context.missing`, `graph.ok`, `graph.nodes` and the drift arrays, and falls back to reading `nodeCount` from `graft/.graph/wiring.json` when the CLI does not report a node count.
 
 ```
 usage: graft-check.sh <repo-path>
@@ -120,28 +120,21 @@ usage: graft-check.sh <repo-path>
 | Exit | Status | Usable | Meaning |
 |---|---|---|---|
 | 0 | `fresh` | true | `context.ok && graph.ok` — both layers fresh and queryable |
-| 0 | `structural_only` | true | `graph.ok && graph.nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent |
-| 1 | `stale` | false | graph exists but drifted (`graph.ok=false` or `context.ok=false` with nodes present) |
-| 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), a graph indexing `graph.nodes=0`, or a pre-0.28 CLI that reports `context.missing=true` without a node count |
+| 0 | `structural_only` | true | `graph.ok && nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent |
+| 1 | `stale` | false | graph exists but drifted (`graph.ok=false` with nodes present) |
+| 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), or a graph indexing `nodes=0` |
+| 3 | `indeterminate` | false | the CLI reports no node count **and** `graft/.graph/wiring.json` is unreadable, so an empty graph cannot be told from a populated one. Do not assert "not initialized" and do not infer "usable" — inspect the `graft/` tree |
 | 10 | `error` (`graft_not_found`) | false | graft CLI not found on PATH or via `npm prefix -g` |
 | 11 | `error` (`unparseable_json`) | false | the CLI produced no parseable check JSON |
 | 12 | `error` (`bad_path`) | false | target is not a directory, or bad usage |
 
-**Why `context.missing` alone is not "uninitialized":** `graft build` without `--deep` produces a structural wiring graph and leaves the markdown concept layer absent, so `context.missing=true` while `graph.ok=true` and `graph.nodes>0`. Verified on 0.28.1: that repo answers `graft ask` normally. Classify on the structural graph first, then report the deep layer separately via `deepLayer`.
+**Why `context.missing` alone is not "uninitialized":** `graft build` without `--deep` produces a structural wiring graph and leaves the markdown concept layer absent, so `context.missing=true` while `graph.ok=true` and `nodes>0`. Verified on 0.28.1: that repo answers `graft ask` normally. Classify on the structural graph first, then report the deep layer separately via `deepLayer`.
 
-Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`), `deepLayer` (`present`/`missing`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,nodes,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
+**Node-count source:** `graph.nodes` exists from 0.28.x on. When a CLI does not report it, the wrapper reads `nodeCount` from `graft/.graph/wiring.json` and records where the number came from in `nodesSource` (`cli` / `wiring.json` / `unknown`). Only when both are unavailable does it return `indeterminate` — it never substitutes a guess.
+
+Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`/`unknown`), `deepLayer` (`present`/`missing`), `nodesSource` (`cli`/`wiring.json`/`unknown`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,nodes,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
 
 The wrapper runs `graft check` (pure I/O + hashing in the installed CLI, no writes) and `graft --version`; it never calls init/build/install/upgrade and never writes to the target repository.
-
-## Commands that require confirmation
-
-| Command | Why |
-|---|---|
-| `npm install -g @nanonets/graft` / `graft upgrade` | Modifies global npm packages |
-| `graft init` | Creates/updates graph and agent wiring; may write user-level agent config unless `--no-global` |
-| `graft build` / `graft build --deep` | Creates/updates `graft/`; `--deep` may use configured LLM credentials and incur provider cost |
-| `graft viz` | Starts a local server; use `--no-open` by default |
-| `graft mcp` | Starts a long-running stdio server; prefer native MCP registration via `graft init` after review |
 
 ## Safer mutation preflight
 
