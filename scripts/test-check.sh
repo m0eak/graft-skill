@@ -95,7 +95,10 @@ check_case() {
   set -e
 
   _cc_bad=0
-  if [ "$_cc_code" -ne "$_cc_want" ]; then
+  if [ "$_cc_code" -eq 124 ]; then
+    printf 'FAIL  %s: timed out (the wrapper hung)\n' "$_cc_label"
+    _cc_bad=1
+  elif [ "$_cc_code" -ne "$_cc_want" ]; then
     printf 'FAIL  %s: exit %s, want %s\n' "$_cc_label" "$_cc_code" "$_cc_want"
     _cc_bad=1
   fi
@@ -181,6 +184,12 @@ fake_graft "{\"context\":$CTX_DRIFT,\"graph\":{\"ok\":false,\"missing\":false,\"
 check_case 'stale: both layers drifted' 1 \
   '+"status":"stale"' '+"staleLayer":"both"'
 
+# 7b. Wiring stale but the deep layer is current -> layer=graph, no --deep advice.
+fresh_repo
+fake_graft "{\"context\":$CTX_OK,\"graph\":{\"ok\":false,\"missing\":false,\"added\":[],\"removed\":[],\"changed\":[{\"file\":\"src/a.ts\"}],\"stale\":[],\"pending\":0,\"nodes\":8}}" 1
+check_case 'stale: wiring only, deep layer current' 1 \
+  '+"status":"stale"' '+"staleLayer":"graph"' '+Do NOT reach for --deep'
+
 # 8-10. Untrustworthy node counts from the CLI -> indeterminate, never usable.
 for _bad in null -1 1.5; do
   fresh_repo
@@ -245,6 +254,12 @@ fresh_repo
 fake_graft 'not-json-at-all' 0
 check_case 'unparseable check output' 11 '+"error":"unparseable_json"'
 
+# 17b. A payload the scanner cannot place must fail fast, not spin. A hang here
+# shows up as exit 124 from the timeout guard inside check_case.
+fresh_repo
+fake_graft '{"context":{"ok":true?,"missing":false},"graph":{"ok":true,"nodes":8}}' 0
+check_case 'unparseable: unrecognised character' 11 '+"error":"unparseable_json"'
+
 # 18. --help exits 0 and prints usage.
 set +e
 "$CHECK" --help > "$OUT" 2> "$ERROUT"
@@ -275,7 +290,7 @@ else
     printf 'export function alpha(x: string): string { return x; }\n' > src/a.ts
     printf 'export function beta(): void {}\n' > src/b.ts
   )
-  if graft build "$REAL" >/dev/null 2>&1; then
+  if graft build "$REAL" > "$ROOT/build.out" 2> "$ROOT/build.err"; then
     set +e
     "$CHECK" "$REAL" > "$OUT" 2> "$ERROUT"
     _code=$?
@@ -303,8 +318,26 @@ else
       FAIL=$((FAIL + 1))
       sed 's/^/      /' "$OUT"
     fi
+    # The wrapper promises not to write to the target repo. With telemetry on,
+    # the CLI would drop graft/.cache/telemetry-repo-id.json there, so run with
+    # DO_NOT_TRACK emptied in the environment and assert the file never appears.
+    rm -f "$REAL/graft/.cache/telemetry-repo-id.json"
+    set +e
+    DO_NOT_TRACK= "$CHECK" "$REAL" > /dev/null 2>&1
+    set -e
+    if [ -f "$REAL/graft/.cache/telemetry-repo-id.json" ]; then
+      printf 'FAIL  real CLI: wrapper wrote telemetry cache into the target repo\n'
+      FAIL=$((FAIL + 1))
+    else
+      printf 'ok    %s\n' 'real CLI: check leaves the repo untouched'
+      PASS=$((PASS + 1))
+    fi
   else
-    skip_case 'real CLI integration (graft build failed)'
+    # A CLI that is present but cannot build is a failure, not a skip: silently
+    # skipping would let a broken environment look like a green suite.
+    printf 'FAIL  real CLI: graft build failed\n'
+    FAIL=$((FAIL + 1))
+    if [ -s "$ROOT/build.err" ]; then sed 's/^/      /' "$ROOT/build.err"; fi
   fi
 fi
 

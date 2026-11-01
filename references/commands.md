@@ -123,7 +123,7 @@ usage: graft-check.sh <repo-path>
 |---|---|---|---|
 | 0 | `fresh` | true | `context.ok && graph.ok` — both layers fresh and queryable |
 | 0 | `structural_only` | true | `graph.ok && nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent. A deep layer that **exists but has drifted** is not this state — it reports `context.missing=false` and falls through to `stale` |
-| 1 | `stale` | false | graph exists but drifted. `staleLayer` says which: `graph` (wiring out of date, no deep layer), `context` (deep layer drifted, wiring fine), or `both`. Only `--deep` repairs the concept layer — a plain `graft build` fixes the structural half alone |
+| 1 | `stale` | false | graph exists but drifted. `staleLayer` says which: `graph` (wiring out of date — the deep layer is either absent or still current), `context` (deep layer drifted, wiring fine), or `both`. Only `--deep` repairs the concept layer; a plain `graft build` fixes the structural half alone. Do not reach for `--deep` when only `graph` drifted — that spends tokens for nothing |
 | 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), or a graph indexing `nodes=0` |
 | 3 | `indeterminate` | false | no trustworthy node count: the CLI reported no `graph.nodes` **or** reported a value that is not a non-negative integer (`null`, `-1`, `1.5`), **and** `graft/.graph/wiring.json` yielded no valid `nodeCount` either. Do not assert "not initialized" and do not infer "usable" — inspect the `graft/` tree |
 | 10 | `error` (`graft_not_found`) | false | graft CLI not found on PATH or via `npm prefix -g` |
@@ -140,7 +140,7 @@ The wrapper runs `graft check` (pure I/O + hashing in the installed CLI, no writ
 
 ### Regressions
 
-`scripts/test-check.sh` is the suite for this state machine — 18 synthetic cases over a fake `graft` (no real CLI, no network, no repo writes) plus 2 integration cases against the installed CLI in a throwaway repo. Run it after any change to `graft-check.sh`:
+`scripts/test-check.sh` is the suite for this state machine — 20 synthetic cases over a fake `graft` (no real CLI, no network, no repo writes) plus 3 integration cases against the installed CLI in a throwaway repo. Run it after any change to `graft-check.sh`:
 
 ```sh
 ./scripts/test-check.sh            # all cases
