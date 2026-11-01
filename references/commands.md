@@ -34,9 +34,11 @@ Newer releases (anything past 0.10.1) have anonymous telemetry **on by default**
 
 | Command | Effect |
 |---|---|
-| `graft telemetry` | Status: state, endpoint, queued count |
-| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing itself, but the invocation still runs the startup hook (update check + 24h flush gate), so it can trigger a detached flush. Use `DO_NOT_TRACK=1 graft telemetry debug` to be sure |
-| `graft telemetry disable` | Turns it off (equivalent to `DO_NOT_TRACK=1`) |
+| `graft telemetry` | **Saved** preference: on/off, endpoint, queued count. The invocation itself runs the startup hook and may trigger the daily flush |
+| `DO_NOT_TRACK=1 graft telemetry debug` | No outbound attempt; prints queued count and the exact batch a flush would POST. Its status line reads "off: DO_NOT_TRACK is set in this environment" — that is the override on this call, not the saved preference |
+| `graft telemetry disable` | Turns telemetry off persistently (equivalent to `DO_NOT_TRACK=1` in the environment) |
+
+Do not read the `DO_NOT_TRACK=1` status line as "the user disabled telemetry". To learn the saved preference, run plain `graft telemetry`; to inspect the payload without sending, run the `DO_NOT_TRACK=1 ... debug` form.
 
 Verified payload fields: `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (opaque UUID), `distinct_id` (per-install id), `timestamp`. No source code, paths, or repository names.
 
@@ -121,7 +123,7 @@ usage: graft-check.sh <repo-path>
 |---|---|---|---|
 | 0 | `fresh` | true | `context.ok && graph.ok` — both layers fresh and queryable |
 | 0 | `structural_only` | true | `graph.ok && nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent. A deep layer that **exists but has drifted** is not this state — it reports `context.missing=false` and falls through to `stale` |
-| 1 | `stale` | false | graph exists but drifted: `graph.ok=false`, or the deep layer exists and has drifted (`context.missing=false`, `context.ok=false`) |
+| 1 | `stale` | false | graph exists but drifted. `staleLayer` says which: `graph` (wiring out of date, no deep layer), `context` (deep layer drifted, wiring fine), or `both`. Only `--deep` repairs the concept layer — a plain `graft build` fixes the structural half alone |
 | 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), or a graph indexing `nodes=0` |
 | 3 | `indeterminate` | false | no trustworthy node count: the CLI reported no `graph.nodes` **or** reported a value that is not a non-negative integer (`null`, `-1`, `1.5`), **and** `graft/.graph/wiring.json` yielded no valid `nodeCount` either. Do not assert "not initialized" and do not infer "usable" — inspect the `graft/` tree |
 | 10 | `error` (`graft_not_found`) | false | graft CLI not found on PATH or via `npm prefix -g` |
@@ -132,7 +134,7 @@ usage: graft-check.sh <repo-path>
 
 **Node-count source:** `graph.nodes` exists from 0.28.x on. When a CLI does not report it, the wrapper reads `nodeCount` from `graft/.graph/wiring.json` and records where the number came from in `nodesSource` (`cli` / `wiring.json` / `unknown`). Only when both are unavailable does it return `indeterminate` — it never substitutes a guess.
 
-Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`/`unknown`), `deepLayer` (`present`/`missing`), `nodesSource` (`cli`/`wiring.json`/`unknown`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,nodes,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
+Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`/`unknown`), `deepLayer` (`present`/`missing`), `staleLayer` (`graph`/`context`/`both`, null unless stale), `nodesSource` (`cli`/`wiring.json`/`unknown`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,nodes,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
 
 The wrapper runs `graft check` (pure I/O + hashing in the installed CLI, no writes) and `graft --version`; it never calls init/build/install/upgrade and never writes to the target repository.
 

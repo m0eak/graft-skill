@@ -37,12 +37,14 @@ Do not hard-code a global npm bin path. The wrapper first resolves `graft` from 
 
 Current graft releases (newer than 0.10.1) ship **anonymous telemetry that is on by default** and flushes daily to `https://events.nanonets.com`. This is a deliberate, disclosed design choice by the upstream project, not a misconfiguration — surface it to the user as information, and let them decide.
 
-Inspect it without anything leaving the machine — `DO_NOT_TRACK=1` is what makes the invocation silent, not the subcommand name:
+Two different questions, two different commands:
 
 ```sh
-DO_NOT_TRACK=1 graft telemetry          # status, endpoint, queued count
-DO_NOT_TRACK=1 graft telemetry debug    # prints the exact batch a flush would POST
+graft telemetry                  # the SAVED preference: on/off, endpoint, queued count
+DO_NOT_TRACK=1 graft telemetry debug   # no outbound at all: queued count + exact payload
 ```
+
+`graft telemetry` reports what the user's machine is actually configured to do, but that invocation runs the startup hook and may trigger the daily flush. `DO_NOT_TRACK=1 graft telemetry debug` makes no outbound attempt and still shows the queue and the batch — but note its status line then reads **"off: DO_NOT_TRACK is set in this environment"**, which reflects the override on this one call, **not** the saved preference. Do not report that as "the user has telemetry disabled".
 
 `debug` prints the batch and sends nothing **itself**, but that is not the whole story. The CLI runs a startup hook (`preAction`) for every subcommand except `version`, `upgrade`, `_update-check` and `mcp` — `telemetry` is not exempt. So a `graft telemetry debug` invocation still evaluates the background update check and the flush gate (24h since the last `flushedAt`), and if that gate is open the invocation can trigger a detached send.
 
@@ -211,8 +213,9 @@ Prefer native MCP registration (via reviewed `graft init`) over manually keeping
 
 ## Output discipline
 
-- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`structural_only`/`stale`/`needs_initialization`/`indeterminate`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`deepLayer`/`nodesSource` from the parsed `graft check --json` output).
+- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`structural_only`/`stale`/`needs_initialization`/`indeterminate`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`deepLayer`/`staleLayer`/`nodesSource` from the parsed `graft check --json` output).
 - `deepLayer: missing` means "no `--deep` concept layer", which is only reassuring when `status` is `structural_only`. If `status` is `needs_initialization` or `indeterminate`, the structural graph itself is absent, empty, or unknown — never describe those as "structural graph only".
+- On `stale`, read `staleLayer` before proposing a fix: `graph` needs a plain `graft build` (local, `$0`); `context` or `both` need `graft build --deep`, which spends provider tokens — a plain build will not repair the concept layer, so recommending it sends the user in a circle.
 - Summarize query results with exact paths/symbols, not speculative conclusions.
 - If no graph exists, offer a preview and wait for approval before creating one.
 - Read [references/commands.md](references/commands.md) for the full command matrix, doctor exit codes, the check-wrapper semantics, and the OpenWrt fallback strategy.
