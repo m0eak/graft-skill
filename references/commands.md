@@ -12,9 +12,54 @@
 | Inspect one file API | `graft skeleton <repo-relative-file> <repo> --json` |
 | Find callers/callees | `graft callers <symbol> <repo> --direction in|out --depth <N|all> --json` |
 | Regex/literal search | `graft grep "<pattern>" <repo> [--fixed] --json` |
+| Diff blast radius | `graft blast <repo> --format json [--base <ref>] [--depth N\|all]` |
 | Check graph freshness (raw) | `graft check <repo> --json` |
+| Telemetry status (read-only) | `graft telemetry` / `graft telemetry debug` |
+| Session savings mix | `graft stats <repo> --json` |
+All query commands normally refresh the graph if it is stale. This is an implicit local write to `graft/`; use `--no-refresh` when the user requests strictly read-only behavior or has not approved graph refresh. `map`, `ask`, `grep`, `callers`, `blast`, and `skeleton` all accept `--no-refresh`.
 
-All query commands normally refresh the graph if it is stale. This is an implicit local write to `graft/`; use `--no-refresh` when the user requests strictly read-only behavior or has not approved graph refresh. `map`, `ask`, `grep`, `callers`, and `skeleton` all accept `--no-refresh`.
+**Do not pipe graft commands through `head`, `tail`, or `sed -n`.** Output is already token-capped and self-describing; clipping it drops hits and strips the `[graft] tokens saved ≈ N` line.
+
+## Providers
+
+`--provider` (or `GRAFT_PROVIDER`) accepts `openai`, `anthropic`, `litellm`, `orcarouter`. The `openai` wire format covers any OpenAI-compatible endpoint via `GRAFT_BASE_URL` (OpenRouter, Fireworks, Groq, a LiteLLM proxy, a local server). Only `build --deep`, `blast --name`, and `skills` need a key; the whole structural path is `$0`.
+
+## Telemetry
+
+Newer releases (anything past 0.10.1) have anonymous telemetry **on by default**, flushing daily to `https://events.nanonets.com`. Surface it as information; treat disabling as the user's call.
+
+| Command | Effect |
+|---|---|
+| `graft telemetry` | Status: state, endpoint, queued count |
+| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing |
+| `graft telemetry disable` | Turns it off (equivalent to `DO_NOT_TRACK=1`) |
+
+Verified payload fields: `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (opaque UUID), `distinct_id` (per-install id), `timestamp`. No source code, paths, or repository names.
+
+## Commands that require confirmation
+
+| Command | Why |
+|---|---|
+| `npm install -g @nanonets/graft` / `graft upgrade` | Modifies global npm packages |
+| `graft init` | Creates/updates graph and agent wiring; may write user-level agent config unless `--no-global` |
+| `graft init --connect/--pair/--look-back` | Sends repo-derived data to Trail's hosted workspace (see below) |
+| `graft build` / `graft build --deep` | Creates/updates `graft/`; `--deep` may use configured LLM credentials and incur provider cost |
+| `graft blast --export-viz <dir>` | Writes a self-contained `index.html` to disk |
+| `graft blast --name` | Uses one cached LLM call; needs `GRAFT_API_KEY` |
+| `graft viz` | Starts a local server; use `--no-open` by default |
+| `graft mcp` | Starts a long-running stdio server; prefer native MCP registration via `graft init` after review |
+| `graft uninstall` | Removes instruction files, MCP/hook entries and repo wiring; default also touches `~/.codex`, `~/.gemini`. Run without `-y` first |
+| `graft skills add/lesson/keep/update/forget/restore` | Mutates locally kept Trail skills |
+
+### Cloud-facing flags (`init`)
+
+| Flag | What leaves the machine |
+|---|---|
+| `--connect <code>` | Connects this machine to a Trail workspace and sends a repo summary — titles, counts, names (upstream states: never code) |
+| `--pair <code>` | Pairs with Trail's onboarding page, which shows the run live, then uploads what it found |
+| `--look-back` / `--plain` | Reviews past agent sessions on this machine |
+
+These sit outside the local `$0` path. Use only when the user asks, and say what leaves the machine first.
 
 ## Pre-flight doctor (`scripts/graft-doctor.sh`)
 
@@ -51,11 +96,11 @@ Key JSON fields: `runtimeVersion`, `supportedSetVersion`, `supportedExtensions`,
 
 ### Supported extensions (dynamic, from the installed package)
 
-The supported-extension set is discovered by `scripts/graft-runtime.sh` from the installed `@nanonets/graft` package — never hard-coded. `runtimeVersion` comes from `graft --version`; `supportedSetVersion` is the package.json version; `supportedExtensions` is extracted from `dist/context/build.js` (`CODE_EXTENSIONS`). The set this skill was validated against (`0.10.1`):
+The supported-extension set is discovered by `scripts/graft-runtime.sh` from the installed `@nanonets/graft` package — never hard-coded. `runtimeVersion` comes from `graft --version`; `supportedSetVersion` is the package.json version; `supportedExtensions` is extracted from `dist/context/build.js` (`CODE_EXTENSIONS`). The set changes between releases (0.10.1 shipped 24; 0.28.1 ships 25, adding `.gleam`), which is why it is read at runtime. The set this skill was last validated against (`0.28.1`):
 
 ```
 .ts .tsx .js .jsx .mjs .cjs .py .go .rs .java .kt .scala
-.rb .php .c .h .cpp .hpp .cc .cs .swift .sql .sh .proto
+.rb .php .c .h .cpp .hpp .cc .cs .swift .gleam .sql .sh .proto
 ```
 
 `--extensions` on `graft build`/`check` only **narrows** this walk set. It does **not** add support for OpenWrt `.config`, YAML/JSON data, `Makefile`, or any other language/file type. Do not present `--extensions` as a way to index unsupported content.

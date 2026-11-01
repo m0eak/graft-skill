@@ -33,6 +33,27 @@ If missing, explain that the install changes global npm state and ask the user f
 
 Do not hard-code a global npm bin path. The wrapper first resolves `graft` from `PATH`, then checks `npm prefix -g`.
 
+## Telemetry and outbound network
+
+Current graft releases (newer than 0.10.1) ship **anonymous telemetry that is on by default** and flushes daily to `https://events.nanonets.com`. This is a deliberate, disclosed design choice by the upstream project, not a misconfiguration — surface it to the user as information, and let them decide.
+
+Inspect it without sending anything:
+
+```sh
+graft telemetry          # status, endpoint, queued count
+graft telemetry debug    # prints the exact batch a flush would POST, sends nothing
+```
+
+What the payload actually contains (verified on the wire body, not the docs): `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (an opaque random UUID), `distinct_id` (per-install id), `timestamp`. It does **not** contain source code, file paths, file names, or repository names.
+
+To turn it off, only if the user asks for it:
+
+```sh
+graft telemetry disable   # or export DO_NOT_TRACK=1
+```
+
+Treat disabling as a user preference, not a required hardening step. If the user is indifferent, leave the default alone and mention the tradeoff in one line rather than pushing the change.
+
 ## Pre-flight: run the doctor before any build/init
 
 Before deciding to build or initialize a repository, run the bundled read-only pre-flight check. It never writes to the target repo; it only runs `graft --version` (read-only) for runtime discovery:
@@ -77,19 +98,43 @@ Supported languages are therefore whatever the **installed** package actually in
 4. Use the narrowest query:
    - Concept/question → `graft ask "<question>" <repo> --source --json`
    - Symbol call impact → `graft callers <symbol> <repo> --direction in|out --depth <N> --json`
+   - Diff blast radius → `graft blast <repo> --format json` (see below)
    - Pattern → `graft grep "<pattern>" <repo> --json`; add `--fixed` for literal input.
    - File API → `graft skeleton <repo-relative-file> <repo> --json`
 5. Use returned exact file/line results to read only the relevant code.
+
+### Never pipe graft output through a filter
+
+Do **not** pipe graft commands through `head`, `tail`, or `sed -n`. Graft's output is already token-capped and states what it dropped; clipping it silently discards hits you asked for and strips the `[graft] tokens saved ≈ N` line that carries the savings figure. Run the command and read its own bounds instead.
+
+### Report what graft saved
+
+Retrieval tools open their output with a `[graft] tokens saved ≈ N` line. When a turn used any graft tool, close the reply with a one-line tally across those calls, e.g. `🌱 graft saved ~12,400 tokens this turn (3 calls)`. Some lines also state a dollar value at the session's actual input rate — include it alongside the token total when present, and never price it yourself when absent. Calls with no savings line (tiny files) saved nothing; skip them.
+
+### Blast radius of a diff
+
+`graft blast` reports what depends on the lines a change touched — the diff-scoped counterpart to `callers --depth N`. It is read-only and `$0`.
+
+```sh
+graft blast <repo> --format json                     # working tree vs HEAD
+graft blast <repo> --base origin/main --format json  # vs a branch's merge base
+```
+
+- `--depth N` (default 2) or `--depth all` controls how far incoming edges are walked.
+- `--format text|markdown|mermaid|json`; `markdown` produces a PR comment with a Mermaid diagram.
+- `--name` adds LLM-named affected areas and needs `GRAFT_API_KEY`; without it, areas are named after their hub symbol.
+- `--export-viz <dir>` writes a self-contained `index.html` — that is a **filesystem write**, so treat it as a mutation requiring confirmation.
+- By default git history is used to suggest reviewers; `--no-owners` disables that, `--pr-author <who>` excludes a given author.
 
 Pass `--no-refresh` to query commands when strictly read-only behavior is required. Without it, Graft may structurally refresh stale files under `graft/` before answering.
 
 ## Supported languages (dynamic, from the installed package)
 
-The supported-extension set is **discovered dynamically** by `graft-runtime.sh` from the installed `@nanonets/graft` package (`dist/context/build.js`), never hard-coded. The doctor's `supportedExtensions` field lists the actual set, and `supportedSetVersion` is the package version that ships it (the source version of the set, **not** a runtime Graft version; use `graft --version` for the installed CLI version). On the machine this skill was validated against, the set is:
+The supported-extension set is **discovered dynamically** by `graft-runtime.sh` from the installed `@nanonets/graft` package (`dist/context/build.js`), never hard-coded. The doctor's `supportedExtensions` field lists the actual set, and `supportedSetVersion` is the package version that ships it (the source version of the set, **not** a runtime Graft version; use `graft --version` for the installed CLI version). The set has already changed across releases — 0.10.1 shipped 24 extensions and 0.28.1 ships 25 (adding `.gleam`) — which is exactly why it must be read from the installed package rather than pinned here. On the machine this skill was validated against (`0.28.1`):
 
 ```
 .ts .tsx .js .jsx .mjs .cjs .py .go .rs .java .kt .scala
-.rb .php .c .h .cpp .hpp .cc .cs .swift .sql .sh .proto
+.rb .php .c .h .cpp .hpp .cc .cs .swift .gleam .sql .sh .proto
 ```
 
 Anything else (OpenWrt `.config`, YAML/JSON data, `Makefile`, `.md`, `.pkl`, binary files, etc.) is not parsed into the graph. `--extensions` only filters this list; it cannot add support for other languages or file types.
@@ -121,6 +166,20 @@ Then explain affected paths and offer the narrowest command. For an Agent-compat
 Use `graft build <repo>` only after approval. It creates/updates `graft/`. Use `--deep` only when the user has approved configured-provider usage and any potential API cost; it needs `GRAFT_PROVIDER`, `GRAFT_MODEL`, `GRAFT_API_KEY`, and possibly `GRAFT_BASE_URL`.
 
 Treat `graft viz` and `graft mcp` as long-running services. Use `viz --no-open` by default; use `mcp` only when configuring an MCP client or when the user explicitly requests the server.
+
+`graft uninstall` is the inverse of `init`: it removes graft's instruction files, MCP/hook entries, and repo wiring, and with default settings also touches out-of-repo config (`~/.codex`, `~/.gemini`). Run it without `-y` first to print what it would remove, report that list, and get explicit confirmation before adding `-y`. `--keep-cache` limits it to wiring and leaves `graft/` plus its `.gitignore` entries intact.
+
+### Consent boundaries for the newer cloud-facing flags
+
+Current `init` also exposes flags that send repository-derived data off the machine. Never use these without the user asking for them specifically, and state what leaves the machine before doing so:
+
+| Flag | What leaves the machine |
+|---|---|
+| `--connect <code>` | Connects this machine to a Trail workspace and sends a summary of the repo — titles, counts and names (upstream states: never code) |
+| `--pair <code>` | Pairs with Trail's onboarding page, which shows the run live for review, then uploads what it found |
+| `--look-back` / `--plain` | Reviews past agent sessions on this machine to surface what isn't kept yet |
+
+`--connect`, `--pair`, and `graft skills` are tied to Trail's hosted workspace. They are outside the local `$0` analysis path; treat them as opt-in integrations rather than default workflow steps.
 
 ## Native MCP tools
 
