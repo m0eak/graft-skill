@@ -37,11 +37,11 @@ Do not hard-code a global npm bin path. The wrapper first resolves `graft` from 
 
 Current graft releases (newer than 0.10.1) ship **anonymous telemetry that is on by default** and flushes daily to `https://events.nanonets.com`. This is a deliberate, disclosed design choice by the upstream project, not a misconfiguration — surface it to the user as information, and let them decide.
 
-Inspect it without sending anything:
+Inspect it without anything leaving the machine — `DO_NOT_TRACK=1` is what makes the invocation silent, not the subcommand name:
 
 ```sh
-graft telemetry          # status, endpoint, queued count
-graft telemetry debug    # prints the exact batch a flush would POST, sends nothing
+DO_NOT_TRACK=1 graft telemetry          # status, endpoint, queued count
+DO_NOT_TRACK=1 graft telemetry debug    # prints the exact batch a flush would POST
 ```
 
 `debug` prints the batch and sends nothing **itself**, but that is not the whole story. The CLI runs a startup hook (`preAction`) for every subcommand except `version`, `upgrade`, `_update-check` and `mcp` — `telemetry` is not exempt. So a `graft telemetry debug` invocation still evaluates the background update check and the flush gate (24h since the last `flushedAt`), and if that gate is open the invocation can trigger a detached send.

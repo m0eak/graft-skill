@@ -293,7 +293,11 @@ nodes_source="cli"
 if [ -z "$graph_nodes" ]; then
   nodes_source="unknown"
   if [ -f "$repo/graft/.graph/wiring.json" ]; then
-    _wn=$(sed -n 's/.*"nodeCount"[^0-9]*\([0-9][0-9]*\).*/\1/p' "$repo/graft/.graph/wiring.json" | head -n 1)
+    # Anchor the match to the value that directly follows "nodeCount": so a
+    # sibling field (edgeCount, pending) can never be mistaken for the count,
+    # and reject null / quoted / negative values rather than coercing them.
+    _wn=$(grep -o '"nodeCount"[[:space:]]*:[[:space:]]*[0-9]\{1,\}' "$repo/graft/.graph/wiring.json" 2>/dev/null \
+          | head -n 1 | grep -o '[0-9]\{1,\}$' || true)
     case "$_wn" in
       ''|*[!0-9]*) : ;;
       *) graph_nodes="$_wn"; nodes_source="wiring.json" ;;
@@ -303,48 +307,33 @@ fi
 # ---------------------------------------------------------------------------
 # Classification from parsed fields only (never the bare CLI exit code)
 #
+# Precedence is deliberate: establish that a graph exists and holds nodes
+# BEFORE any "fresh" verdict. Otherwise a graph reporting ok/ok with an unknown
+# or zero node count would be advertised as usable.
+#
+#   1. no graph at all             -> needs_initialization
+#   2. graph holds 0 nodes         -> needs_initialization
+#   3. node count unknowable       -> indeterminate (never infer usable)
+#   4. graph.ok && context.ok      -> fresh
+#   5. graph.ok && context.missing -> structural_only (usable; no --deep layer)
+#   6. otherwise                   -> stale
+#
 # A plain `graft build` builds the structural wiring graph only; the markdown
 # concept layer needs `--deep`. Such a repo reports context.missing=true while
-# graph.ok=true and graph.nodes>0 — and `graft ask`/`grep`/`callers`/`skeleton`/
-# `map` all answer from that graph. It is therefore usable, not uninitialized.
-#
-# graph.nodes only exists from 0.28.x on. When it is absent (older CLI) the
-# wrapper stays conservative and keeps the pre-0.28 behaviour: context.missing
-# means no queryable graph was found.
+# graph.ok=true and nodes>0 — and ask/grep/callers/skeleton/map all answer from
+# that graph, so it is usable rather than uninitialized.
 # ---------------------------------------------------------------------------
-structural_usable=false
-case "$graph_nodes" in
-  ''|*[!0-9]*) : ;;
-  *) if [ "$graph_ok" = true ] && [ "$graph_nodes" -gt 0 ]; then structural_usable=true; fi ;;
-esac
-
 deep_layer="present"
 if [ "$context_missing" = true ]; then
   deep_layer="missing"
 fi
 
-if [ "$context_ok" = true ] && [ "$graph_ok" = true ]; then
-  status="fresh"
-  exit_code=0
-  usable=true
-  freshness="fresh"
-  signal="graph is fresh and usable (context.ok && graph.ok)"
-  recommendation="Graph is fresh and queryable. Orient with: graft map <repo> --json --no-refresh. Append --no-refresh for strict read-only queries."
-  notes="[\"context.ok=true and graph.ok=true.\",\"Queries can run now; use --no-refresh in strict read-only mode.\"]"
-elif [ "$structural_usable" = true ] && [ "$context_missing" = true ]; then
-  status="structural_only"
-  exit_code=0
-  usable=true
-  freshness="fresh"
-  signal="structural graph is fresh and queryable; the LLM concept layer is absent (context.missing=true, graph.nodes=$graph_nodes)"
-  recommendation="The structural wiring graph is current, so ask/grep/callers/skeleton/map all work. This is the normal state after a plain 'graft build' — the markdown concept layer only exists after 'graft build --deep', which costs provider tokens. Do NOT report this repo as needing initialization. Use --no-refresh for strict read-only queries."
-  notes="[\"context.missing=true with graph.nodes=$graph_nodes is the expected result of a structural-only build.\",\"Queries are usable; only the prose concept layer is missing.\",\"Run 'graft build --deep' only if the user wants that layer and accepts provider cost.\"]"
-elif [ "$graph_missing" = true ]; then
+if [ "$graph_missing" = true ]; then
   status="needs_initialization"
   exit_code=2
   usable=false
   freshness="not_built"
-  signal="no graph present (graph.missing=true) even though the CLI exited $CLI_EXIT"
+  signal="no graph present (graph.missing=true); the CLI exited $CLI_EXIT"
   recommendation="No graph exists in this repo. Do NOT treat the repo as queryable based on the CLI exit code alone. Run the doctor, then init/build only after explicit user confirmation; start with 'graft init <repo> --dry-run --no-global' for a preview. Nothing was modified."
   notes="[\"No graph present; the repo needs initialization before queries.\",\"CLI exit code $CLI_EXIT is NOT sufficient to call this repo usable.\",\"Run graft-doctor.sh first, then init/build only after explicit user confirmation.\"]"
 elif [ -n "$graph_nodes" ] && [ "$graph_nodes" = "0" ]; then
@@ -352,25 +341,41 @@ elif [ -n "$graph_nodes" ] && [ "$graph_nodes" = "0" ]; then
   exit_code=2
   usable=false
   freshness="not_built"
-  signal="graph exists but indexes 0 nodes (graph.nodes=0)"
+  signal="graph exists but indexes 0 nodes (nodes=0, source: $nodes_source)"
   recommendation="The graph is present but empty, so there is nothing to query. Check that the repo contains files in a supported language (run graft-doctor.sh); if it does, rebuild only after explicit user confirmation. Do not treat an empty graph as usable."
-  notes="[\"graph.nodes=0: the graph holds no symbols.\",\"Run graft-doctor.sh to confirm the repo has supported source files.\",\"Rebuild only after explicit user confirmation.\"]"
-elif [ -z "$graph_nodes" ] && [ "$context_missing" = true ]; then
+  notes="[\"nodes=0: the graph holds no symbols.\",\"Run graft-doctor.sh to confirm the repo has supported source files.\",\"Rebuild only after explicit user confirmation.\"]"
+elif [ -z "$graph_nodes" ]; then
   status="indeterminate"
   exit_code=3
   usable=false
   freshness="unknown"
-  signal="this CLI reports neither graph.nodes nor a readable graft/.graph/wiring.json nodeCount, so an empty graph cannot be distinguished from a populated one"
-  recommendation="Do not report this repo as needing initialization on this evidence alone. Inspect graft/.graph/wiring.json (or the graft/ tree) directly, or confirm with the doctor, before proposing any build. Nothing was modified."
-  notes="[\"graph.nodes is absent from this CLI's check output (pre-0.28 format).\",\"No node count could be read from graft/.graph/wiring.json either.\",\"Verdict is genuinely unknown; do not assert 'not initialized' and do not infer 'usable'.\",\"Inspect the graft/ tree directly before proposing a rebuild.\"]"
+  signal="no node count is available (the CLI reported no graph.nodes and graft/.graph/wiring.json yielded no usable nodeCount), so an empty graph cannot be distinguished from a populated one"
+  recommendation="Do not report this repo as needing initialization on this evidence alone, and do not call it usable either. Inspect graft/.graph/wiring.json (or the graft/ tree) directly, or confirm with the doctor, before proposing any build. Nothing was modified."
+  notes="[\"graph.nodes is absent from this CLI's check output (pre-0.28 format).\",\"No valid nodeCount could be read from graft/.graph/wiring.json either.\",\"Verdict is genuinely unknown; do not assert 'not initialized' and do not infer 'usable'.\",\"Inspect the graft/ tree directly before proposing a rebuild.\"]"
+elif [ "$graph_ok" = true ] && [ "$context_ok" = true ]; then
+  status="fresh"
+  exit_code=0
+  usable=true
+  freshness="fresh"
+  signal="graph is fresh and usable (graph.ok && context.ok, nodes=$graph_nodes)"
+  recommendation="Graph is fresh and queryable. Orient with: graft map <repo> --json --no-refresh. Append --no-refresh for strict read-only queries."
+  notes="[\"graph.ok=true and context.ok=true.\",\"Queries can run now; use --no-refresh in strict read-only mode.\"]"
+elif [ "$graph_ok" = true ]; then
+  status="structural_only"
+  exit_code=0
+  usable=true
+  freshness="fresh"
+  signal="structural graph is fresh and queryable (nodes=$graph_nodes); the LLM concept layer is absent (context.missing=true)"
+  recommendation="The structural wiring graph is current, so ask/grep/callers/skeleton/map all work. This is the normal state after a plain 'graft build' — the markdown concept layer only exists after 'graft build --deep', which costs provider tokens. Do NOT report this repo as needing initialization. Use --no-refresh for strict read-only queries."
+  notes="[\"context.missing=true with nodes=$graph_nodes is the expected result of a structural-only build.\",\"Queries are usable; only the prose concept layer is missing.\",\"Run 'graft build --deep' only if the user wants that layer and accepts provider cost.\"]"
 else
   status="stale"
   exit_code=1
   usable=false
   freshness="stale"
-  signal="graph has drifted (context.ok=$context_ok, graph.ok=$graph_ok)"
+  signal="graph has drifted (graph.ok=$graph_ok, context.ok=$context_ok, nodes=$graph_nodes)"
   recommendation="The graph has drifted from the code. Rebuild only after explicit user confirmation ('graft build <repo>', or 'graft init <repo> --no-build' to adjust wiring), then re-run this check. Nothing was modified."
-  notes="[\"context.ok=$context_ok, graph.ok=$graph_ok (CLI exit $CLI_EXIT).\",\"Graph exists but is not fresh; queries would use stale data.\",\"Rebuild only after explicit user confirmation.\"]"
+  notes="[\"graph.ok=$graph_ok, context.ok=$context_ok (CLI exit $CLI_EXIT).\",\"Graph exists but is not fresh; queries would use stale data.\",\"Rebuild only after explicit user confirmation.\"]"
 fi
 
 # graph.nodes as JSON (null when the CLI did not report it)

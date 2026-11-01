@@ -111,7 +111,7 @@ The supported-extension set is discovered by `scripts/graft-runtime.sh` from the
 
 ## Check wrapper (`scripts/graft-check.sh`)
 
-Safe JSON wrapper around `graft check <repo> --json`. It reports the real CLI exit code but **never classifies from it alone**: the CLI exits 0 for an empty graph, for a healthy structural-only graph, and even when no graph exists. It parses `context.ok`, `context.missing`, `graph.ok`, `graph.nodes` and the drift arrays, and falls back to reading `nodeCount` from `graft/.graph/wiring.json` when the CLI does not report a node count.
+Safe JSON wrapper around `graft check <repo> --json`. It reports the real CLI exit code but **never classifies from it alone**. Measured on 0.28.1: the CLI exits **0** both for an empty graph (`nodes=0`) and for a healthy structural-only graph, and exits **1** when no graph exists at all — the same code it uses for a stale graph. So a 0 does not prove the graph is usable, and a 1 does not say which failure it is. The wrapper parses `context.ok`, `context.missing`, `graph.ok`, `graph.nodes` and the drift arrays, and falls back to reading `nodeCount` from `graft/.graph/wiring.json` when the CLI does not report a node count.
 
 ```
 usage: graft-check.sh <repo-path>
