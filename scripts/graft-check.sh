@@ -240,6 +240,7 @@ context_ok="false"; context_missing="false"; context_drifted="false"
 graph_ok="false"; graph_missing="false"; graph_drifted="false"
 context_contentDrift=0; context_removed=0; context_coverage=0; context_indexDrift=0
 graph_added=0; graph_removed=0; graph_changed=0; graph_stale=0; graph_pending=0
+graph_nodes=""
 
 while IFS= read -r line; do
   [ -n "$line" ] || continue
@@ -255,6 +256,7 @@ while IFS= read -r line; do
     context.indexDrift) context_indexDrift="$val" ;;
     graph.ok) graph_ok="$val" ;;
     graph.missing) graph_missing="$val" ;;
+    graph.nodes) graph_nodes="$val" ;;
     graph) if [ "$val" = null ]; then graph_ok=false; graph_missing=true; fi ;;
     graph.added) graph_added="$val" ;;
     graph.removed) graph_removed="$val" ;;
@@ -275,16 +277,28 @@ if [ "$graph_added" -gt 0 ] || [ "$graph_removed" -gt 0 ] \
 fi
 # ---------------------------------------------------------------------------
 # Classification from parsed fields only (never the bare CLI exit code)
+#
+# A plain `graft build` builds the structural wiring graph only; the markdown
+# concept layer needs `--deep`. Such a repo reports context.missing=true while
+# graph.ok=true and graph.nodes>0 — and `graft ask`/`grep`/`callers`/`skeleton`/
+# `map` all answer from that graph. It is therefore usable, not uninitialized.
+#
+# graph.nodes only exists from 0.28.x on. When it is absent (older CLI) the
+# wrapper stays conservative and keeps the pre-0.28 behaviour: context.missing
+# means no queryable graph was found.
 # ---------------------------------------------------------------------------
+structural_usable=false
+case "$graph_nodes" in
+  ''|*[!0-9]*) : ;;
+  *) if [ "$graph_ok" = true ] && [ "$graph_nodes" -gt 0 ]; then structural_usable=true; fi ;;
+esac
+
+deep_layer="present"
 if [ "$context_missing" = true ]; then
-  status="needs_initialization"
-  exit_code=2
-  usable=false
-  freshness="not_built"
-  signal="no context graph present (context.missing=true) even though the CLI exited $CLI_EXIT"
-  recommendation="No context graph exists in this repo (graft check reports context.missing=true). Do NOT treat the repo as queryable based on the CLI exit code alone. Run the doctor, then init/build only after explicit user confirmation; start with 'graft init <repo> --dry-run --no-global' for a preview. Nothing was modified."
-  notes="[\"No context graph present; the repo needs initialization before queries.\",\"CLI exit code $CLI_EXIT is NOT sufficient to call this repo usable.\",\"Run graft-doctor.sh first, then init/build only after explicit user confirmation.\"]"
-elif [ "$context_ok" = true ] && [ "$graph_ok" = true ]; then
+  deep_layer="missing"
+fi
+
+if [ "$context_ok" = true ] && [ "$graph_ok" = true ]; then
   status="fresh"
   exit_code=0
   usable=true
@@ -292,6 +306,38 @@ elif [ "$context_ok" = true ] && [ "$graph_ok" = true ]; then
   signal="graph is fresh and usable (context.ok && graph.ok)"
   recommendation="Graph is fresh and queryable. Orient with: graft map <repo> --json --no-refresh. Append --no-refresh for strict read-only queries."
   notes="[\"context.ok=true and graph.ok=true.\",\"Queries can run now; use --no-refresh in strict read-only mode.\"]"
+elif [ "$structural_usable" = true ] && [ "$context_missing" = true ]; then
+  status="structural_only"
+  exit_code=0
+  usable=true
+  freshness="fresh"
+  signal="structural graph is fresh and queryable; the LLM concept layer is absent (context.missing=true, graph.nodes=$graph_nodes)"
+  recommendation="The structural wiring graph is current, so ask/grep/callers/skeleton/map all work. This is the normal state after a plain 'graft build' — the markdown concept layer only exists after 'graft build --deep', which costs provider tokens. Do NOT report this repo as needing initialization. Use --no-refresh for strict read-only queries."
+  notes="[\"context.missing=true with graph.nodes=$graph_nodes is the expected result of a structural-only build.\",\"Queries are usable; only the prose concept layer is missing.\",\"Run 'graft build --deep' only if the user wants that layer and accepts provider cost.\"]"
+elif [ "$graph_missing" = true ]; then
+  status="needs_initialization"
+  exit_code=2
+  usable=false
+  freshness="not_built"
+  signal="no graph present (graph.missing=true) even though the CLI exited $CLI_EXIT"
+  recommendation="No graph exists in this repo. Do NOT treat the repo as queryable based on the CLI exit code alone. Run the doctor, then init/build only after explicit user confirmation; start with 'graft init <repo> --dry-run --no-global' for a preview. Nothing was modified."
+  notes="[\"No graph present; the repo needs initialization before queries.\",\"CLI exit code $CLI_EXIT is NOT sufficient to call this repo usable.\",\"Run graft-doctor.sh first, then init/build only after explicit user confirmation.\"]"
+elif [ -n "$graph_nodes" ] && [ "$graph_nodes" = "0" ]; then
+  status="needs_initialization"
+  exit_code=2
+  usable=false
+  freshness="not_built"
+  signal="graph exists but indexes 0 nodes (graph.nodes=0)"
+  recommendation="The graph is present but empty, so there is nothing to query. Check that the repo contains files in a supported language (run graft-doctor.sh); if it does, rebuild only after explicit user confirmation. Do not treat an empty graph as usable."
+  notes="[\"graph.nodes=0: the graph holds no symbols.\",\"Run graft-doctor.sh to confirm the repo has supported source files.\",\"Rebuild only after explicit user confirmation.\"]"
+elif [ -z "$graph_nodes" ] && [ "$context_missing" = true ]; then
+  status="needs_initialization"
+  exit_code=2
+  usable=false
+  freshness="not_built"
+  signal="context.missing=true and no graph node count reported by this CLI version"
+  recommendation="This CLI version does not report graph.nodes, so the wrapper cannot tell an empty graph from a populated one. Run the doctor, then init/build only after explicit user confirmation. Nothing was modified."
+  notes="[\"graph.nodes is absent from this CLI's check output (pre-0.28 format).\",\"Falling back to the conservative verdict: not usable.\",\"Run graft-doctor.sh before proposing a build.\"]"
 else
   status="stale"
   exit_code=1
@@ -301,6 +347,12 @@ else
   recommendation="The graph has drifted from the code. Rebuild only after explicit user confirmation ('graft build <repo>', or 'graft init <repo> --no-build' to adjust wiring), then re-run this check. Nothing was modified."
   notes="[\"context.ok=$context_ok, graph.ok=$graph_ok (CLI exit $CLI_EXIT).\",\"Graph exists but is not fresh; queries would use stale data.\",\"Rebuild only after explicit user confirmation.\"]"
 fi
+
+# graph.nodes as JSON (null when the CLI did not report it)
+case "$graph_nodes" in
+  ''|*[!0-9]*) graph_nodes_json="null" ;;
+  *) graph_nodes_json="$graph_nodes" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Emit one machine-parseable JSON document
@@ -313,11 +365,11 @@ if [ -n "$CLI_VERSION" ]; then
   cli_ver_json=$(printf '"%s"' "$(printf '%s' "$CLI_VERSION" | sed 's/\\/\\\\/g; s/"/\\"/g')")
 fi
 
-printf '{"schema":1,"wrapper":"graft-check.sh","repo":"%s","status":"%s","usable":%s,"freshness":"%s","context":{"ok":%s,"missing":%s,"drifted":%s,"contentDrift":%s,"removed":%s,"coverage":%s,"indexDrift":%s},"graph":{"ok":%s,"missing":%s,"drifted":%s,"added":%s,"removed":%s,"changed":%s,"stale":%s,"pending":%s},"cli":{"found":true,"version":%s,"exitCode":%s},"signal":"%s","recommendation":"%s","notes":%s}\n' \
-  "$repo_esc" "$status" "$usable" "$freshness" \
+printf '{"schema":1,"wrapper":"graft-check.sh","repo":"%s","status":"%s","usable":%s,"freshness":"%s","deepLayer":"%s","context":{"ok":%s,"missing":%s,"drifted":%s,"contentDrift":%s,"removed":%s,"coverage":%s,"indexDrift":%s},"graph":{"ok":%s,"missing":%s,"drifted":%s,"nodes":%s,"added":%s,"removed":%s,"changed":%s,"stale":%s,"pending":%s},"cli":{"found":true,"version":%s,"exitCode":%s},"signal":"%s","recommendation":"%s","notes":%s}\n' \
+  "$repo_esc" "$status" "$usable" "$freshness" "$deep_layer" \
   "$context_ok" "$context_missing" "$context_drifted" \
   "$context_contentDrift" "$context_removed" "$context_coverage" "$context_indexDrift" \
-  "$graph_ok" "$graph_missing" "$graph_drifted" \
+  "$graph_ok" "$graph_missing" "$graph_drifted" "$graph_nodes_json" \
   "$graph_added" "$graph_removed" "$graph_changed" "$graph_stale" "$graph_pending" \
   "$cli_ver_json" "$CLI_EXIT" "$sig_esc" "$rec_esc" "$notes"
 

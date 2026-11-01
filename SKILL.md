@@ -44,6 +44,8 @@ graft telemetry          # status, endpoint, queued count
 graft telemetry debug    # prints the exact batch a flush would POST, sends nothing
 ```
 
+`debug` is an inspection command only — it does not send, and it does not stop the scheduled daily flush either. If the user wants no outbound telemetry, the lever is `graft telemetry disable` (or `DO_NOT_TRACK=1`), not `debug`.
+
 What the payload actually contains (verified on the wire body, not the docs): `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (an opaque random UUID), `distinct_id` (per-install id), `timestamp`. It does **not** contain source code, file paths, file names, or repository names.
 
 To turn it off, only if the user asks for it:
@@ -93,7 +95,7 @@ Supported languages are therefore whatever the **installed** package actually in
 
 0. Pre-flight: `./scripts/graft-doctor.sh <repo>`. If the status is `unsupported` or `partial`, follow the fallback strategy below instead of proposing a build. If it is `unavailable` (exit 5), the supported set could not be determined — do not guess; follow the doctor's guidance (install graft or check the package manually).
 1. Require a repository root or locate one from the task context.
-2. Check graph usability/freshness with the safe wrapper: `./scripts/graft-check.sh <repo>`. It wraps `graft check <repo> --json`, parses `context.ok` / `context.missing` / `graph.ok`, and reports `usable` / `freshness` / `graph` semantics without trusting the CLI exit code alone (the CLI can exit 0 while `context.missing=true`, which must be treated as "needs initialization", not "usable").
+2. Check graph usability/freshness with the safe wrapper: `./scripts/graft-check.sh <repo>`. It wraps `graft check <repo> --json`, parses `context.ok` / `context.missing` / `graph.ok` / `graph.nodes`, and reports `usable` / `freshness` / `deepLayer` without trusting the CLI exit code alone. It reports `structural_only` (usable) when the structural graph is current but the LLM concept layer is absent — the normal state after a plain `graft build` — and reserves `needs_initialization` for a genuinely absent or empty graph.
 3. If a usable graph exists, orient with `graft map <repo> --json`.
 4. Use the narrowest query:
    - Concept/question → `graft ask "<question>" <repo> --source --json`
@@ -109,21 +111,26 @@ Do **not** pipe graft commands through `head`, `tail`, or `sed -n`. Graft's outp
 
 ### Report what graft saved
 
-Retrieval tools open their output with a `[graft] tokens saved ≈ N` line. When a turn used any graft tool, close the reply with a one-line tally across those calls, e.g. `🌱 graft saved ~12,400 tokens this turn (3 calls)`. Some lines also state a dollar value at the session's actual input rate — include it alongside the token total when present, and never price it yourself when absent. Calls with no savings line (tiny files) saved nothing; skip them.
+In its human-readable (text) output, a retrieval tool opens with a `[graft] tokens saved ≈ N` line when the call actually saved anything. When a turn used graft tools in text mode, close the reply with a one-line tally across those calls, e.g. `🌱 graft saved ~12,400 tokens this turn (3 calls)`. Some lines also state a dollar value at the session's actual input rate — include it alongside the token total when present, and never price it yourself when absent.
+
+Two cases where a missing line does **not** mean "saved nothing":
+
+- **`--json` output never carries the savings line.** JSON is the machine-readable surface, so its absence there is expected. Do not report "saved 0" from a JSON call — say the figure was not provided, or re-run in text mode if the user wants the number.
+- **Genuinely tiny targets** (where the pointers cost as much as the source) save nothing and print no line; those can be skipped.
 
 ### Blast radius of a diff
 
-`graft blast` reports what depends on the lines a change touched — the diff-scoped counterpart to `callers --depth N`. It is read-only and `$0`.
+`graft blast` reports what depends on the lines a change touched — the diff-scoped counterpart to `callers --depth N`. It is `$0` and makes no LLM call, but like every query command **it refreshes a stale graph before answering**, so it can write under `graft/`. Add `--no-refresh` for strict read-only use.
 
 ```sh
-graft blast <repo> --format json                     # working tree vs HEAD
-graft blast <repo> --base origin/main --format json  # vs a branch's merge base
+graft blast <repo> --format json --no-refresh                     # working tree vs HEAD
+graft blast <repo> --base origin/main --format json --no-refresh  # vs a branch's merge base
 ```
 
 - `--depth N` (default 2) or `--depth all` controls how far incoming edges are walked.
 - `--format text|markdown|mermaid|json`; `markdown` produces a PR comment with a Mermaid diagram.
 - `--name` adds LLM-named affected areas and needs `GRAFT_API_KEY`; without it, areas are named after their hub symbol.
-- `--export-viz <dir>` writes a self-contained `index.html` — that is a **filesystem write**, so treat it as a mutation requiring confirmation.
+- `--export-viz <dir>` writes a self-contained `index.html` — a **filesystem write**, so treat it as a mutation requiring confirmation.
 - By default git history is used to suggest reviewers; `--no-owners` disables that, `--pr-author <who>` excludes a given author.
 
 Pass `--no-refresh` to query commands when strictly read-only behavior is required. Without it, Graft may structurally refresh stale files under `graft/` before answering.
@@ -196,7 +203,7 @@ Prefer native MCP registration (via reviewed `graft init`) over manually keeping
 
 ## Output discipline
 
-- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`stale`/`needs_initialization`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`graph` from the parsed `graft check --json` output).
+- State the repository, the doctor status (`ready`/`partial`/`unsupported`/`uninitialized`/`unavailable`), and the graft-check result (`fresh`/`structural_only`/`stale`/`needs_initialization`/`error`). The doctor does **not** judge freshness — report its `"freshness":"not_checked"` and confirm actual freshness with `./scripts/graft-check.sh <repo>` (it reports `usable`/`freshness`/`deepLayer` from the parsed `graft check --json` output). Report `deepLayer: missing` as "structural graph only", never as "not initialized".
 - Summarize query results with exact paths/symbols, not speculative conclusions.
 - If no graph exists, offer a preview and wait for approval before creating one.
 - Read [references/commands.md](references/commands.md) for the full command matrix, doctor exit codes, the check-wrapper semantics, and the OpenWrt fallback strategy.

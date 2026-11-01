@@ -12,13 +12,17 @@
 | Inspect one file API | `graft skeleton <repo-relative-file> <repo> --json` |
 | Find callers/callees | `graft callers <symbol> <repo> --direction in|out --depth <N|all> --json` |
 | Regex/literal search | `graft grep "<pattern>" <repo> [--fixed] --json` |
-| Diff blast radius | `graft blast <repo> --format json [--base <ref>] [--depth N\|all]` |
+| Diff blast radius | `graft blast <repo> --format json --no-refresh [--base <ref>] [--depth N\|all]` |
 | Check graph freshness (raw) | `graft check <repo> --json` |
 | Telemetry status (read-only) | `graft telemetry` / `graft telemetry debug` |
 | Session savings mix | `graft stats <repo> --json` |
 All query commands normally refresh the graph if it is stale. This is an implicit local write to `graft/`; use `--no-refresh` when the user requests strictly read-only behavior or has not approved graph refresh. `map`, `ask`, `grep`, `callers`, `blast`, and `skeleton` all accept `--no-refresh`.
 
 **Do not pipe graft commands through `head`, `tail`, or `sed -n`.** Output is already token-capped and self-describing; clipping it drops hits and strips the `[graft] tokens saved ≈ N` line.
+
+## Token savings reporting
+
+In text mode a retrieval tool opens with `[graft] tokens saved ≈ N` when the call saved anything; sum those lines and report the turn total (e.g. `🌱 graft saved ~12,400 tokens this turn (3 calls)`). Verified on 0.28.1: the line appears in text output for a large target, and is **absent from `--json` output** by design. So a missing line in JSON is not evidence of zero savings — report "not provided", or re-run in text mode when the number matters.
 
 ## Providers
 
@@ -31,7 +35,7 @@ Newer releases (anything past 0.10.1) have anonymous telemetry **on by default**
 | Command | Effect |
 |---|---|
 | `graft telemetry` | Status: state, endpoint, queued count |
-| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing |
+| `graft telemetry debug` | Prints the exact batch a flush would POST; sends nothing, but does not stop the scheduled flush either |
 | `graft telemetry disable` | Turns it off (equivalent to `DO_NOT_TRACK=1`) |
 
 Verified payload fields: `app_version`, `os`, `arch`, `node_major`, `ci`, `agent_host`, `cli_name`, `command`, `surface`, `repo_id` (opaque UUID), `distinct_id` (per-install id), `timestamp`. No source code, paths, or repository names.
@@ -115,14 +119,17 @@ usage: graft-check.sh <repo-path>
 
 | Exit | Status | Usable | Meaning |
 |---|---|---|---|
-| 0 | `fresh` | true | `context.ok && graph.ok` — graph is fresh and queryable |
-| 1 | `stale` | false | context/graph exists but drifted (`context.ok=false` or `graph.ok=false`) |
-| 2 | `needs_initialization` | false | `context.missing=true` (even if the CLI exited 0); also covers `graph: null` when nothing is built |
+| 0 | `fresh` | true | `context.ok && graph.ok` — both layers fresh and queryable |
+| 0 | `structural_only` | true | `graph.ok && graph.nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent |
+| 1 | `stale` | false | graph exists but drifted (`graph.ok=false` or `context.ok=false` with nodes present) |
+| 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), a graph indexing `graph.nodes=0`, or a pre-0.28 CLI that reports `context.missing=true` without a node count |
 | 10 | `error` (`graft_not_found`) | false | graft CLI not found on PATH or via `npm prefix -g` |
 | 11 | `error` (`unparseable_json`) | false | the CLI produced no parseable check JSON |
 | 12 | `error` (`bad_path`) | false | target is not a directory, or bad usage |
 
-Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
+**Why `context.missing` alone is not "uninitialized":** `graft build` without `--deep` produces a structural wiring graph and leaves the markdown concept layer absent, so `context.missing=true` while `graph.ok=true` and `graph.nodes>0`. Verified on 0.28.1: that repo answers `graft ask` normally. Classify on the structural graph first, then report the deep layer separately via `deepLayer`.
+
+Key JSON fields: `status`, `usable`, `freshness` (`fresh`/`stale`/`not_built`), `deepLayer` (`present`/`missing`), `context.{ok,missing,drifted,contentDrift,removed,coverage,indexDrift}`, `graph.{ok,missing,drifted,nodes,added,removed,changed,stale,pending}`, `cli.{found,version,exitCode}`, `signal`, `recommendation`, `notes`.
 
 The wrapper runs `graft check` (pure I/O + hashing in the installed CLI, no writes) and `graft --version`; it never calls init/build/install/upgrade and never writes to the target repository.
 
