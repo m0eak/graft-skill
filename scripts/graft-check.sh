@@ -272,6 +272,13 @@ while IFS= read -r line; do
   esac
 done < "$tmpdir/fields"
 
+# A node count is only trusted when it is a complete non-negative integer. The
+# CLI's JSON may surface `null`, `-1` or `1.5`; reading any of those as a
+# populated graph would report an unusable graph as usable.
+case "$graph_nodes" in
+  ''|*[!0-9]*) graph_nodes="" ;;
+esac
+
 # drifted = at least one drift array non-empty
 if [ "$context_contentDrift" -gt 0 ] || [ "$context_removed" -gt 0 ] \
    || [ "$context_coverage" -gt 0 ] || [ "$context_indexDrift" -gt 0 ]; then
@@ -292,12 +299,16 @@ fi
 nodes_source="cli"
 if [ -z "$graph_nodes" ]; then
   nodes_source="unknown"
-  if [ -f "$repo/graft/.graph/wiring.json" ]; then
+  # When the CLI says the graph is absent, a leftover wiring file is
+  # contradictory evidence — reporting its node count alongside "no graph"
+  # would be self-refuting, so the fallback only applies to a present graph.
+  if [ "$graph_missing" != true ] && [ -f "$repo/graft/.graph/wiring.json" ]; then
     # Anchor the match to the value that directly follows "nodeCount": so a
-    # sibling field (edgeCount, pending) can never be mistaken for the count,
-    # and reject null / quoted / negative values rather than coercing them.
-    _wn=$(grep -o '"nodeCount"[[:space:]]*:[[:space:]]*[0-9]\{1,\}' "$repo/graft/.graph/wiring.json" 2>/dev/null \
-          | head -n 1 | grep -o '[0-9]\{1,\}$' || true)
+    # sibling field (edgeCount, pending) can never be mistaken for the count.
+    # Capture the whole numeric token, dots included, then reject anything that
+    # is not pure digits — otherwise `1.5` would be truncated to `1`.
+    _wn=$(grep -o '"nodeCount"[[:space:]]*:[[:space:]]*[0-9][0-9.]*' "$repo/graft/.graph/wiring.json" 2>/dev/null \
+          | head -n 1 | sed 's/^.*:[[:space:]]*//' || true)
     case "$_wn" in
       ''|*[!0-9]*) : ;;
       *) graph_nodes="$_wn"; nodes_source="wiring.json" ;;
@@ -311,12 +322,16 @@ fi
 # BEFORE any "fresh" verdict. Otherwise a graph reporting ok/ok with an unknown
 # or zero node count would be advertised as usable.
 #
-#   1. no graph at all             -> needs_initialization
-#   2. graph holds 0 nodes         -> needs_initialization
-#   3. node count unknowable       -> indeterminate (never infer usable)
-#   4. graph.ok && context.ok      -> fresh
-#   5. graph.ok && context.missing -> structural_only (usable; no --deep layer)
-#   6. otherwise                   -> stale
+#   1. no graph at all                        -> needs_initialization
+#   2. graph holds 0 nodes                    -> needs_initialization
+#   3. node count unknowable                  -> indeterminate (never infer usable)
+#   4. graph.ok && context.ok                 -> fresh
+#   5. graph.ok && context.missing            -> structural_only (usable)
+#   6. otherwise (graph exists but stale)     -> stale
+#
+# Branch 5 requires context.missing=true. A deep layer that EXISTS but has
+# drifted also reports graph.ok=true with context.ok=false; treating that as
+# structural_only would advertise a stale graph as fresh and usable.
 #
 # A plain `graft build` builds the structural wiring graph only; the markdown
 # concept layer needs `--deep`. Such a repo reports context.missing=true while
@@ -360,7 +375,7 @@ elif [ "$graph_ok" = true ] && [ "$context_ok" = true ]; then
   signal="graph is fresh and usable (graph.ok && context.ok, nodes=$graph_nodes)"
   recommendation="Graph is fresh and queryable. Orient with: graft map <repo> --json --no-refresh. Append --no-refresh for strict read-only queries."
   notes="[\"graph.ok=true and context.ok=true.\",\"Queries can run now; use --no-refresh in strict read-only mode.\"]"
-elif [ "$graph_ok" = true ]; then
+elif [ "$graph_ok" = true ] && [ "$context_missing" = true ]; then
   status="structural_only"
   exit_code=0
   usable=true

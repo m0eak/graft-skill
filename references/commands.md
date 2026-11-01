@@ -120,10 +120,10 @@ usage: graft-check.sh <repo-path>
 | Exit | Status | Usable | Meaning |
 |---|---|---|---|
 | 0 | `fresh` | true | `context.ok && graph.ok` — both layers fresh and queryable |
-| 0 | `structural_only` | true | `graph.ok && nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent |
-| 1 | `stale` | false | graph exists but drifted (`graph.ok=false` with nodes present) |
+| 0 | `structural_only` | true | `graph.ok && nodes>0 && context.missing` — the normal result of a plain `graft build` (no `--deep`). ask/grep/callers/skeleton/map all answer from this graph; only the prose concept layer is absent. A deep layer that **exists but has drifted** is not this state — it reports `context.missing=false` and falls through to `stale` |
+| 1 | `stale` | false | graph exists but drifted: `graph.ok=false`, or the deep layer exists and has drifted (`context.missing=false`, `context.ok=false`) |
 | 2 | `needs_initialization` | false | no graph at all (`graph.missing=true`), or a graph indexing `nodes=0` |
-| 3 | `indeterminate` | false | the CLI reports no node count **and** `graft/.graph/wiring.json` is unreadable, so an empty graph cannot be told from a populated one. Do not assert "not initialized" and do not infer "usable" — inspect the `graft/` tree |
+| 3 | `indeterminate` | false | no trustworthy node count: the CLI reported no `graph.nodes` **or** reported a value that is not a non-negative integer (`null`, `-1`, `1.5`), **and** `graft/.graph/wiring.json` yielded no valid `nodeCount` either. Do not assert "not initialized" and do not infer "usable" — inspect the `graft/` tree |
 | 10 | `error` (`graft_not_found`) | false | graft CLI not found on PATH or via `npm prefix -g` |
 | 11 | `error` (`unparseable_json`) | false | the CLI produced no parseable check JSON |
 | 12 | `error` (`bad_path`) | false | target is not a directory, or bad usage |
